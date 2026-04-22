@@ -61,6 +61,8 @@ def reset_cached_views():
     st.session_state["quiz_session_id"] = None
     st.session_state["quiz_attempt"] = None
     st.session_state["quiz_attempt_session_id"] = None
+    st.session_state["wrong_questions"] = None
+    st.session_state["wrong_questions_filters"] = None
     st.session_state["plan_data"] = None
     st.session_state["plan_session_id"] = None
     st.session_state["report_data"] = None
@@ -377,15 +379,62 @@ def refresh_learning_report():
         st.error(extract_error_message(response))
 
 
-def refresh_learning_plan():
+def load_learning_plan(only_incomplete: bool = False):
     response = requests.get(
         f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/plan",
+        params={"only_incomplete": str(bool(only_incomplete)).lower()},
         timeout=120,
     )
     if response.ok:
         st.session_state["plan_data"] = response.json()["plan"]
         st.session_state["plan_session_id"] = st.session_state["selected_session_id"]
-        st.success("学习计划已刷新。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def generate_learning_plan():
+    payload = {"user_id": st.session_state["user_id"]}
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/plan",
+        json=payload,
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["plan_data"] = response.json()["plan"]
+        st.session_state["plan_session_id"] = st.session_state["selected_session_id"]
+        st.success("学习计划已生成并保存。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def update_plan_item(item_id: int, is_completed: bool):
+    response = requests.patch(
+        f"{API_BASE_URL}/study_plans/items/{item_id}",
+        json={"is_completed": bool(is_completed)},
+        timeout=30,
+    )
+    if response.ok:
+        load_learning_plan(only_incomplete=st.session_state.get("plan_only_incomplete", False))
+    else:
+        st.error(extract_error_message(response))
+
+
+def fetch_wrong_questions(session_id: int | None, max_score: float | None, recent_days: int | None):
+    params = {"user_id": st.session_state["user_id"]}
+    if session_id is not None:
+        params["session_id"] = session_id
+    if max_score is not None:
+        params["max_score"] = max_score
+    if recent_days is not None:
+        params["recent_days"] = recent_days
+    response = requests.get(f"{API_BASE_URL}/wrong_questions", params=params, timeout=30)
+    if response.ok:
+        st.session_state["wrong_questions"] = response.json()["items"]
+        st.session_state["wrong_questions_filters"] = {
+            "session_id": session_id,
+            "max_score": max_score,
+            "recent_days": recent_days,
+        }
     else:
         st.error(extract_error_message(response))
 
@@ -431,6 +480,10 @@ def get_current_plan():
     if st.session_state.get("plan_session_id") == st.session_state.get("selected_session_id"):
         return st.session_state.get("plan_data")
     return None
+
+
+def get_current_wrong_questions():
+    return st.session_state.get("wrong_questions") or []
 
 
 st.set_page_config(page_title="LearnOS", layout="wide")
@@ -491,6 +544,12 @@ if "plan_data" not in st.session_state:
     st.session_state["plan_data"] = None
 if "plan_session_id" not in st.session_state:
     st.session_state["plan_session_id"] = None
+if "wrong_questions" not in st.session_state:
+    st.session_state["wrong_questions"] = None
+if "wrong_questions_filters" not in st.session_state:
+    st.session_state["wrong_questions_filters"] = None
+if "plan_only_incomplete" not in st.session_state:
+    st.session_state["plan_only_incomplete"] = False
 if "new_session_name_input" not in st.session_state:
     st.session_state["new_session_name_input"] = ""
 
@@ -642,7 +701,7 @@ with st.expander("会话概览", expanded=False):
         st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-chat_tab, quiz_tab, plan_tab, report_tab = st.tabs(["学习问答", "测验模式", "学习计划", "学习报告"])
+chat_tab, quiz_tab, wrong_tab, plan_tab, report_tab = st.tabs(["学习问答", "测验模式", "错题本", "学习计划", "学习报告"])
 
 with chat_tab:
     st.subheader("学习问答")
@@ -737,6 +796,120 @@ with quiz_tab:
                 if item.get("suggestion"):
                     st.caption(f"建议：{item['suggestion']}")
 
+with wrong_tab:
+    st.subheader("错题本")
+    session_filter_options = {"全部会话": None}
+    for item in sessions:
+        session_filter_options[f"{item['session_name']} (#{item['id']})"] = item["id"]
+
+    filter_col1, filter_col2, filter_col3 = st.columns([1.2, 1, 1])
+    with filter_col1:
+        selected_wrong_session_label = st.selectbox("会话筛选", options=list(session_filter_options.keys()))
+    with filter_col2:
+        selected_max_score = st.selectbox("分数筛选", options=["3 分及以下", "2 分及以下", "1 分及以下", "全部"], index=0)
+    with filter_col3:
+        selected_recent_label = st.selectbox("时间筛选", options=["最近 7 天", "最近 30 天", "全部"], index=0)
+
+    max_score_mapping = {"3 分及以下": 3.0, "2 分及以下": 2.0, "1 分及以下": 1.0, "全部": None}
+    recent_days_mapping = {"最近 7 天": 7, "最近 30 天": 30, "全部": None}
+    selected_wrong_session_id = session_filter_options[selected_wrong_session_label]
+    selected_max_score_value = max_score_mapping[selected_max_score]
+    selected_recent_days = recent_days_mapping[selected_recent_label]
+
+    if st.button("刷新错题本", use_container_width=True):
+        fetch_wrong_questions(
+            session_id=selected_wrong_session_id,
+            max_score=selected_max_score_value,
+            recent_days=selected_recent_days,
+        )
+
+    wrong_questions = get_current_wrong_questions()
+    if wrong_questions:
+        st.caption(f"当前共筛出 {len(wrong_questions)} 条错题记录。")
+        for item in wrong_questions:
+            session_text = item.get("session_name") or f"会话 #{item.get('session_id')}"
+            score_text = f"{item.get('score', 0)} / {item.get('max_score', 5)}"
+            title = item.get("question_text") or item.get("topic") or "未命名错题"
+            with st.expander(f"{title} | {score_text} | {session_text}", expanded=False):
+                st.markdown(f"**题目**：{item.get('question_text') or item.get('topic')}")
+                st.caption(f"记录时间：{item.get('created_at', '')}")
+                st.markdown(f"**评分反馈**：{item.get('feedback', item.get('summary', ''))}")
+                if item.get("suggestion"):
+                    st.markdown(f"**改进建议**：{item['suggestion']}")
+                if item.get("reference_answer"):
+                    st.markdown("**参考答案要点**")
+                    st.write(item["reference_answer"])
+    else:
+        st.caption("点击上方按钮，按会话、分数和时间筛选当前错题。")
+
+with plan_tab:
+    st.subheader("学习计划")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再生成学习计划。")
+    else:
+        plan_action_col1, plan_action_col2 = st.columns([1, 1])
+        with plan_action_col1:
+            if st.button("生成 / 刷新学习计划", use_container_width=True):
+                generate_learning_plan()
+        with plan_action_col2:
+            only_incomplete = st.checkbox("今天只看未完成项", key="plan_only_incomplete")
+            if st.button("加载已保存学习计划", use_container_width=True):
+                load_learning_plan(only_incomplete=only_incomplete)
+
+        plan = get_current_plan()
+        if plan:
+            st.markdown(f"**{plan.get('title', '学习计划')}**")
+            st.write(plan.get("overview", ""))
+
+            plan_col1, plan_col2 = st.columns(2)
+            with plan_col1:
+                st.markdown("**今天学什么**")
+                for item in plan.get("today_focus", []):
+                    value = st.checkbox(
+                        item["text"],
+                        value=bool(item.get("is_completed", False)),
+                        key=f"plan_item_{item['id']}",
+                    )
+                    if value != bool(item.get("is_completed", False)):
+                        update_plan_item(item["id"], value)
+                        st.rerun()
+
+                st.markdown("**先复习什么**")
+                for item in plan.get("priority_review", []):
+                    value = st.checkbox(
+                        item["text"],
+                        value=bool(item.get("is_completed", False)),
+                        key=f"plan_item_{item['id']}",
+                    )
+                    if value != bool(item.get("is_completed", False)):
+                        update_plan_item(item["id"], value)
+                        st.rerun()
+
+            with plan_col2:
+                st.markdown("**下一步问什么**")
+                for item in plan.get("next_questions", []):
+                    value = st.checkbox(
+                        item["text"],
+                        value=bool(item.get("is_completed", False)),
+                        key=f"plan_item_{item['id']}",
+                    )
+                    if value != bool(item.get("is_completed", False)):
+                        update_plan_item(item["id"], value)
+                        st.rerun()
+
+                st.markdown("**行动步骤**")
+                for item in plan.get("action_steps", []):
+                    value = st.checkbox(
+                        item["text"],
+                        value=bool(item.get("is_completed", False)),
+                        key=f"plan_item_{item['id']}",
+                    )
+                    if value != bool(item.get("is_completed", False)):
+                        update_plan_item(item["id"], value)
+                        st.rerun()
+        else:
+            st.caption("点击上方按钮生成并保存计划，或加载当前会话最近一次已保存计划。")
+
 with report_tab:
     st.subheader("学习报告")
     if st.session_state["selected_session_id"] is None:
@@ -774,37 +947,3 @@ with report_tab:
                     st.write(f"- {item}")
         else:
             st.caption("点击上方按钮生成当前学习会话的复盘报告。")
-
-with plan_tab:
-    st.subheader("学习计划")
-    if st.session_state["selected_session_id"] is None:
-        st.info("先新建会话或导入资料后再生成学习计划。")
-    else:
-        if st.button("生成 / 刷新学习计划", use_container_width=True):
-            refresh_learning_plan()
-
-        plan = get_current_plan()
-        if plan:
-            st.markdown(f"**{plan.get('title', '学习计划')}**")
-            st.write(plan.get("overview", ""))
-
-            plan_col1, plan_col2 = st.columns(2)
-            with plan_col1:
-                st.markdown("**今天学什么**")
-                for item in plan.get("today_focus", []):
-                    st.write(f"- {item}")
-
-                st.markdown("**先复习什么**")
-                for item in plan.get("priority_review", []):
-                    st.write(f"- {item}")
-
-            with plan_col2:
-                st.markdown("**下一步问什么**")
-                for item in plan.get("next_questions", []):
-                    st.write(f"- {item}")
-
-                st.markdown("**行动步骤**")
-                for item in plan.get("action_steps", []):
-                    st.write(f"- {item}")
-        else:
-            st.caption("点击上方按钮，基于当前会话的知识点、复习项和测验结果生成计划。")

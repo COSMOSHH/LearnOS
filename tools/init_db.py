@@ -165,6 +165,36 @@ def init_study_db() -> str:
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            overview TEXT,
+            source_type TEXT DEFAULT 'generated',
+            status TEXT DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_plan_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            item_type TEXT NOT NULL,
+            item_text TEXT NOT NULL,
+            sort_order INTEGER DEFAULT 0,
+            is_completed INTEGER DEFAULT 0,
+            metadata_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_date ON study_sessions(user_id, session_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_documents_session_id ON study_documents(session_id)")
@@ -174,6 +204,8 @@ def init_study_db() -> str:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_sets_session_id ON quiz_sets(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_questions_set_id ON quiz_questions(quiz_set_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_attempts_session_user ON quiz_attempts(session_id, user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_study_plans_session_id ON study_plans(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_study_plan_items_plan_id ON study_plan_items(plan_id)")
 
     _ensure_column(cursor, "study_documents", "source_type", "TEXT DEFAULT 'upload'")
     _ensure_column(cursor, "study_documents", "metadata_json", "TEXT")

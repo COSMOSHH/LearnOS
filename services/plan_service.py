@@ -1,3 +1,18 @@
+import json
+import sqlite3
+from pathlib import Path
+
+
+DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
+PLAN_ITEM_TYPES = ["today_focus", "priority_review", "next_questions", "action_steps"]
+
+
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def generate_learning_plan(
     session: dict,
     knowledge_points: list[dict],
@@ -132,3 +147,135 @@ JSON 结构：
         pass
 
     return fallback_plan
+
+
+def save_learning_plan(session_id: int, user_id: str, plan: dict, source_type: str = "generated") -> int:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE study_plans
+        SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+        WHERE session_id = ? AND user_id = ? AND status = 'active'
+        """,
+        (session_id, user_id),
+    )
+    cursor.execute(
+        """
+        INSERT INTO study_plans (session_id, user_id, title, overview, source_type, status)
+        VALUES (?, ?, ?, ?, ?, 'active')
+        """,
+        (
+            session_id,
+            user_id,
+            plan.get("title", "学习计划"),
+            plan.get("overview", ""),
+            source_type,
+        ),
+    )
+    plan_id = cursor.lastrowid
+
+    for item_type in PLAN_ITEM_TYPES:
+        for sort_order, item_text in enumerate(plan.get(item_type, []) or [], start=1):
+            cursor.execute(
+                """
+                INSERT INTO study_plan_items (plan_id, item_type, item_text, sort_order, is_completed, metadata_json)
+                VALUES (?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    plan_id,
+                    item_type,
+                    str(item_text).strip(),
+                    sort_order,
+                    json.dumps({}, ensure_ascii=False),
+                ),
+            )
+
+    conn.commit()
+    conn.close()
+    return plan_id
+
+
+def _serialize_plan(plan_row: sqlite3.Row | dict, item_rows: list[sqlite3.Row | dict], only_incomplete: bool = False) -> dict:
+    plan_row = dict(plan_row)
+    grouped = {key: [] for key in PLAN_ITEM_TYPES}
+    for raw_item in item_rows:
+        item = dict(raw_item)
+        is_completed = bool(item.get("is_completed", 0))
+        if only_incomplete and is_completed:
+            continue
+        grouped.setdefault(item["item_type"], []).append(
+            {
+                "id": item["id"],
+                "text": item["item_text"],
+                "is_completed": is_completed,
+                "sort_order": item.get("sort_order", 0),
+            }
+        )
+
+    return {
+        "plan_id": plan_row["id"],
+        "session_id": plan_row["session_id"],
+        "title": plan_row.get("title", "学习计划"),
+        "overview": plan_row.get("overview", ""),
+        "status": plan_row.get("status", "active"),
+        "created_at": plan_row.get("created_at"),
+        "today_focus": grouped.get("today_focus", []),
+        "priority_review": grouped.get("priority_review", []),
+        "next_questions": grouped.get("next_questions", []),
+        "action_steps": grouped.get("action_steps", []),
+    }
+
+
+def get_latest_learning_plan(session_id: int, only_incomplete: bool = False) -> dict | None:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT *
+        FROM study_plans
+        WHERE session_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (session_id,),
+    )
+    plan_row = cursor.fetchone()
+    if plan_row is None:
+        conn.close()
+        return None
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM study_plan_items
+        WHERE plan_id = ?
+        ORDER BY item_type ASC, sort_order ASC, id ASC
+        """,
+        (plan_row["id"],),
+    )
+    item_rows = cursor.fetchall()
+    conn.close()
+    return _serialize_plan(plan_row, item_rows, only_incomplete=only_incomplete)
+
+
+def update_plan_item_completion(item_id: int, is_completed: bool) -> dict | None:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE study_plan_items
+        SET is_completed = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (1 if is_completed else 0, item_id),
+    )
+    conn.commit()
+    cursor.execute("SELECT * FROM study_plan_items WHERE id = ?", (item_id,))
+    item = cursor.fetchone()
+    conn.close()
+    if item is None:
+        return None
+    row = dict(item)
+    row["is_completed"] = bool(row.get("is_completed", 0))
+    return row

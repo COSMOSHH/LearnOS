@@ -192,6 +192,71 @@ def get_review_items_for_session(session_id: int):
     return rows
 
 
+def get_quiz_feedback_items(
+    user_id: str,
+    session_id: int | None = None,
+    max_score: float | None = None,
+    recent_days: int | None = None,
+):
+    conn = _connect()
+    cursor = conn.cursor()
+    params = [user_id]
+    query = """
+        SELECT *
+        FROM review_items
+        WHERE user_id = ? AND source_type = 'quiz_feedback'
+    """
+    if session_id is not None:
+        query += " AND session_id = ?"
+        params.append(session_id)
+    query += " ORDER BY created_at DESC, id DESC"
+    cursor.execute(query, tuple(params))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    now = datetime.now(timezone.utc)
+    filtered = []
+    for row in rows:
+        metadata = json.loads(row.get("metadata_json") or "{}")
+        score = float(metadata.get("score", 0) or 0)
+        if max_score is not None and score > float(max_score):
+            continue
+
+        created_at_raw = row.get("created_at")
+        created_at = None
+        if created_at_raw:
+            try:
+                created_at = datetime.fromisoformat(str(created_at_raw).replace(" ", "T"))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                created_at = None
+        if recent_days is not None and created_at is not None:
+            if created_at < now - timedelta(days=int(recent_days)):
+                continue
+
+        filtered.append(
+            {
+                "id": row["id"],
+                "session_id": row.get("session_id"),
+                "topic": row.get("topic", ""),
+                "summary": row.get("summary", ""),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "priority_score": row.get("priority_score", 0),
+                "error_count": row.get("error_count", 0),
+                "question_index": metadata.get("question_index"),
+                "question_text": metadata.get("question_text", ""),
+                "score": score,
+                "max_score": float(metadata.get("max_score", 5) or 5),
+                "feedback": metadata.get("feedback", ""),
+                "suggestion": metadata.get("suggestion", ""),
+                "reference_answer": metadata.get("reference_answer", ""),
+            }
+        )
+    return filtered
+
+
 def build_review_context(user_id: str, query: str, current_session_id: int | None = None, limit: int = 2):
     conn = _connect()
     cursor = conn.cursor()

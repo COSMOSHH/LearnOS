@@ -35,7 +35,12 @@ from services.document_service import (
     save_document_summary,
     save_knowledge_points,
 )
-from services.plan_service import generate_learning_plan
+from services.plan_service import (
+    generate_learning_plan,
+    get_latest_learning_plan,
+    save_learning_plan,
+    update_plan_item_completion,
+)
 from services.quiz_service import (
     create_quiz_set,
     generate_quiz_bundle,
@@ -51,6 +56,7 @@ from services.review_service import (
     build_review_context,
     create_review_items_from_knowledge_points,
     create_review_items_from_quiz_feedback,
+    get_quiz_feedback_items,
     get_review_items_for_session,
 )
 from services.study_session_service import create_study_session, delete_study_session, get_study_session, list_study_sessions, update_study_session
@@ -118,6 +124,14 @@ class QuizSubmitRequest(BaseModel):
     user_id: str
     quiz_set_id: int
     answers: list[str]
+
+
+class PlanGenerateRequest(BaseModel):
+    user_id: str
+
+
+class PlanItemUpdateRequest(BaseModel):
+    is_completed: bool
 
 
 def _ingest_text_resource(
@@ -434,6 +448,17 @@ def _build_learning_plan(session_id: int):
     if not session:
         raise HTTPException(status_code=404, detail="Study session not found.")
 
+    stored = get_latest_learning_plan(session_id)
+    return {"session_id": session_id, "plan": stored}
+
+
+def _generate_and_save_learning_plan(session_id: int, user_id: str):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You do not have access to this session.")
+
     plan = generate_learning_plan(
         session=session,
         knowledge_points=get_session_knowledge_points(session_id),
@@ -442,7 +467,8 @@ def _build_learning_plan(session_id: int):
         latest_quiz_attempt=get_latest_quiz_attempt_for_session(session_id, session["user_id"]),
         llm_generator=llm_generator,
     )
-    return {"session_id": session_id, "plan": plan}
+    plan_id = save_learning_plan(session_id=session_id, user_id=user_id, plan=plan)
+    return {"session_id": session_id, "plan": get_latest_learning_plan(session_id), "plan_id": plan_id}
 
 
 def _delete_session_resources(session_id: int, user_id: str):
@@ -534,8 +560,43 @@ async def get_session_report_endpoint(session_id: int):
 
 
 @app.get("/study_sessions/{session_id}/plan")
-async def get_session_plan_endpoint(session_id: int):
-    return _build_learning_plan(session_id)
+async def get_session_plan_endpoint(session_id: int, only_incomplete: bool = Query(False)):
+    payload = _build_learning_plan(session_id)
+    if payload["plan"] is None:
+        return payload
+    return {"session_id": session_id, "plan": get_latest_learning_plan(session_id, only_incomplete=only_incomplete)}
+
+
+@app.post("/study_sessions/{session_id}/plan")
+async def generate_session_plan_endpoint(session_id: int, request: PlanGenerateRequest):
+    return _generate_and_save_learning_plan(session_id=session_id, user_id=request.user_id)
+
+
+@app.patch("/study_plans/items/{item_id}")
+async def update_plan_item_endpoint(item_id: int, request: PlanItemUpdateRequest):
+    item = update_plan_item_completion(item_id=item_id, is_completed=request.is_completed)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Plan item not found.")
+    return {"item": item}
+
+
+@app.get("/wrong_questions")
+async def get_wrong_questions_endpoint(
+    user_id: str = Query(...),
+    session_id: int | None = Query(None),
+    max_score: float | None = Query(None),
+    recent_days: int | None = Query(None),
+):
+    items = get_quiz_feedback_items(
+        user_id=user_id,
+        session_id=session_id,
+        max_score=max_score,
+        recent_days=recent_days,
+    )
+    session_name_map = {item["id"]: item["session_name"] for item in list_study_sessions(user_id)}
+    for item in items:
+        item["session_name"] = session_name_map.get(item.get("session_id"), "")
+    return {"items": items}
 
 
 @app.post("/study_sessions/{session_id}/documents")
