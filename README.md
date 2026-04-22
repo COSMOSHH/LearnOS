@@ -1,150 +1,82 @@
 # LearnOS
 
-一个面向个人学习、文档问答、自动复习和面试准备的多 Agent 学习系统。
+面向个人学习、资料问答、自动复习和面试准备的学习型 Agent 系统。
 
-项目由原有旅行场景多 Agent 项目改造而来，当前已经完成第一阶段的大部分核心链路：上传资料、自动创建学习会话、中文摘要/知识点提取、会话内 RAG 问答、自动复习注入、中文前端工作台。
-
-## 项目定位
-
-这个项目的目标不是做一个普通聊天机器人，而是做一个：
-
-1. 能接收当天学习资料的学习型 Agent。
-2. 能围绕资料持续问答的 RAG 系统。
-3. 能自动带出历史知识点复习的记忆型 Agent。
-4. 能作为 Agent 应用开发岗位求职作品展示工程能力的项目。
+当前版本已经完成第一阶段的核心闭环：学习资料导入、自动生成学习会话、会话内 RAG 问答、复习提醒注入，以及中文工作台。近期新增了网页学习资料导入、学习会话删除、单机单用户固定会话视图等能力，已经可以稳定支撑本地演示。
 
 ## 当前能力
 
-当前版本已经支持：
+1. 支持导入 `pdf / docx / txt / md` 文件。
+2. 支持导入单个网页链接，并抽取正文后进入同一套学习入库链路。
+3. 支持“导入到当前会话”和“根据资料新建学习会话”两种模式。
+4. 支持自动生成学习会话名称、学习主题、学习目标。
+5. 支持资料切块、向量入库、会话内检索问答。
+6. 支持自动生成摘要、关键词、知识点、面试要点。
+7. 支持把知识点转成复习项，并在问答时注入复习提醒。
+8. 支持查看历史学习会话，并删除当前学习会话。
+9. 支持流式回答、来源展示、复习提醒展示。
 
-1. 创建学习会话。
-2. 根据上传资料自动生成会话名称、学习主题和学习目标。
-3. 上传 `pdf/docx/txt/md` 学习资料。
-4. 自动完成文档解析、切分、向量入库。
-5. 自动生成中文摘要、关键词、知识点和面试要点。
-6. 将知识点转成复习项。
-7. 在当前学习会话内基于资料进行问答。
-8. 回答时展示来源片段。
-9. 自动注入相关复习内容。
-10. 使用中文 Streamlit 界面完成基本学习工作流。
+## 适合演示的亮点
+
+1. 从本地文件学习助手升级成“多源学习资料工作台”。
+2. 同一条入库链路同时支持文件与网页资料，扩展成本低。
+3. 会话级隔离的 RAG 检索，回答更聚焦当前学习主题。
+4. 问答与复习项联动，体现“学习系统”而不只是“聊天系统”。
+5. 保留多 Agent 架构基础，便于后续继续接测验、规划、评测模块。
 
 ## 项目结构
 
 ```text
 LearnOS/
-├─ Zero_RAG/
-│  ├─ Server.py                  # FastAPI 后端入口
-│  ├─ Client.py                  # Streamlit 中文前端
-│  ├─ agent_engine.py            # 多 Agent 路由与调度
-│  ├─ base_data_model.py         # Agent 工具 schema
-│  ├─ chat_history_service.py    # 聊天历史与线程状态
-│  ├─ llm_generator.py           # LLM 调用封装
-│  └─ RAG/
-│     ├─ document_loader.py      # 文档解析
-│     ├─ text_splitter.py        # 文本切分
-│     ├─ vector_store.py         # Chroma 封装
-│     ├─ hybrid_retriever.py     # 混合检索
-│     └─ config.py               # RAG 配置
-├─ services/
-│  ├─ study_session_service.py   # 学习会话数据服务
-│  ├─ document_service.py        # 文档与摘要数据服务
-│  ├─ review_service.py          # 复习项数据服务
-│  └─ summary_service.py         # 中文摘要与会话信息推断
-├─ tools/
-│  ├─ init_db.py                 # SQLite 初始化
-│  ├─ learning_ingest_tools.py   # 学习资料处理工具
-│  ├─ review_tools.py            # 复习工具
-│  ├─ quiz_tools.py              # 测验工具
-│  ├─ planner_tools.py           # 计划工具
-│  └─ retriever_vector.py        # 本地学习文档检索工具
-├─ 产品功能清单与优先级.md
-├─ 数据库表结构设计.md
-├─ 多Agent架构图.md
-├─ 第一阶段实施任务拆解.md
-└─ 学习辅助Agent项目改造计划.md
+├── Zero_RAG/
+│   ├── Client.py                # Streamlit 前端
+│   ├── Server.py                # FastAPI 后端
+│   ├── chat_history_service.py  # 聊天历史与线程状态
+│   ├── llm_generator.py         # LLM 调用封装
+│   └── RAG/
+│       ├── document_loader.py   # 文件解析
+│       ├── hybrid_retriever.py  # 检索融合
+│       ├── text_splitter.py     # 文本切块
+│       └── vector_store.py      # Chroma 封装
+├── services/
+│   ├── document_service.py      # 文档、摘要、知识点存储
+│   ├── review_service.py        # 复习项与复习上下文
+│   ├── study_session_service.py # 学习会话 CRUD
+│   ├── summary_service.py       # 摘要与会话元信息生成
+│   └── webpage_service.py       # 网页正文抽取
+├── tools/
+│   └── init_db.py               # SQLite 初始化
+├── README.md
+├── 阶段性完成报告.md
+└── 产品功能清单与优先级.md
 ```
-
-## 技术栈
-
-1. Python
-2. FastAPI
-3. Streamlit
-4. SQLite
-5. ChromaDB
-6. BM25 + 向量检索 + Rerank
-7. OpenAI 兼容接口 / DashScope 兼容调用
-
-## 核心流程
-
-### 1. 上传资料
-
-1. 用户上传 `pdf/docx/txt/md` 文件。
-2. 后端解析文档文本。
-3. 文本切分后写入 Chroma。
-4. 系统生成中文摘要、关键词、知识点和面试要点。
-5. 系统自动根据资料生成：
-   - 会话名称
-   - 学习主题
-   - 学习目标
-
-### 2. 学习问答
-
-1. 用户围绕当前学习会话提问。
-2. 系统只在当前会话内做 RAG 检索。
-3. 回答时附带来源片段。
-4. 系统从 `review_items` 中挑选相关旧知识，生成轻量复习提醒。
-
-### 3. 多 Agent 协作
-
-当前多 Agent 结构包括：
-
-1. `primary_assistant`
-   负责主控、理解意图和组织回答。
-2. `learning_ingest_assistant`
-   负责资料准备、知识点提取。
-3. `review_assistant`
-   负责复习提醒和复习项构建。
-4. `quiz_assistant`
-   负责测验生成和自测评分。
-5. `planner_assistant`
-   负责学习计划拆解。
 
 ## 启动方式
 
 ### 1. 安装依赖
 
-当前仓库还没有完整依赖清单，至少需要这些核心依赖：
+当前仓库还没有正式整理 `requirements.txt`，本地运行至少需要这些核心依赖：
 
 ```bash
-pip install fastapi uvicorn streamlit requests pydantic chromadb PyPDF2 python-docx jieba rank-bm25 openai
+pip install fastapi uvicorn streamlit requests pydantic chromadb PyPDF2 python-docx jieba rank-bm25 openai beautifulsoup4
 ```
-
-如果你使用 DashScope / 阿里兼容接口，还需要准备相应 SDK 与环境变量。
 
 ### 2. 配置环境变量
 
-至少需要配置：
+至少需要：
 
 ```bash
 DASHSCOPE_API_KEY=your_api_key
 BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
-如果后续启用联网搜索，还需要：
-
-```bash
-TAVILY_API_KEY=your_api_key
-```
-
 ### 3. 启动后端
-
-在项目根目录执行：
 
 ```bash
 python Zero_RAG/Server.py
 ```
 
-默认监听：
+默认地址：
 
 ```text
 http://127.0.0.1:8000
@@ -152,75 +84,77 @@ http://127.0.0.1:8000
 
 ### 4. 启动前端
 
-在项目根目录执行：
-
 ```bash
 streamlit run Zero_RAG/Client.py
 ```
 
-## 当前数据说明
-
-项目当前使用两个本地 SQLite 文件：
+## 数据存储说明
 
 1. `study_agent.sqlite3`
    学习会话、文档、摘要、知识点、复习项。
 2. `chat_history.sqlite3`
    聊天历史和线程状态。
+3. `Zero_RAG/chroma_db`
+   向量数据。
+4. `uploaded_study_materials`
+   上传资料的本地副本。
 
-向量数据默认保存在：
+## 当前默认用户策略
 
-```text
-Zero_RAG/chroma_db
-```
+当前前端为了避免“新开页面看不到旧会话”，默认固定为单机单用户模式。
 
-## 当前已完成功能
+位置：
+
+1. [Zero_RAG/Client.py](Zero_RAG/Client.py) 中的 `DEFAULT_USER_ID`
+2. [Zero_RAG/Client.py](Zero_RAG/Client.py) 中的 `ensure_user_id()`
+
+如果要改回用户隔离：
+
+1. 把 `DEFAULT_USER_ID` 改回动态生成策略。
+2. 把 `ensure_user_id()` 改回“优先读取 query param，没有则生成 UUID”。
+3. 后端接口不需要改，后端本来就是按 `user_id` 做学习会话隔离的。
+
+## 当前交互说明
+
+1. 学习会话在侧边栏选择。
+2. 文件和网页导入都支持：
+   `新建学习会话`
+   `导入当前会话`
+3. 提问框按回车提交。
+4. 回答为流式输出。
+5. “会话概览”位于“学习问答”上方，可折叠。
+6. 支持删除当前会话。
+
+## 当前已完成 / 未完成
 
 ### 已完成
 
-1. 旅行场景工具、schema、prompt 已替换为学习场景。
-2. 前端中文界面已经完成。
-3. 学习会话支持刷新后继续查看。
-4. 上传资料后自动创建会话信息，不再需要手填。
-5. 文档解析、切分、入库已接通。
-6. 会话内 RAG 问答已接通。
-7. 自动复习注入已接通。
-8. 中文摘要与知识点生成已接入。
+1. 文件导入闭环。
+2. 网页导入闭环。
+3. 学习会话自动创建与管理。
+4. 会话内 RAG 问答。
+5. 复习提醒注入。
+6. 会话删除能力。
+7. 单机单用户稳定会话视图。
 
 ### 部分完成
 
-1. 多 Agent 工具层已经改成学习场景，但前端主问答路径当前主要走 `/chat`，不是完全依赖 `/agent_chat`。
-2. 测验和计划工具文件已经有基础实现，但还没有完整接进前端工作流。
+1. 多 Agent 架构基础还在，但前台主链路仍以 `/chat` 为主。
+2. 复习系统已经可用，但还没有完整的复习调度页面。
+3. 测验、学习计划等工具文件存在，但还没有接进前端主工作流。
 
 ### 未完成
 
-1. 完整依赖清单和环境安装说明还未沉淀为正式 `requirements.txt`。
-2. 测验模式、错题本、学习计划页面还没正式做完。
-3. 学习报告、评测闭环、执行日志、知识图谱还未实现。
-4. 已经导入过的旧英文摘要数据不会自动回填成中文，需要重新导入生成。
-
-## 适合展示的亮点
-
-这个项目当前比较适合在简历或面试里强调：
-
-1. 从旧多 Agent 项目迁移到学习场景的能力。
-2. RAG + 结构化记忆 + 自动复习的组合设计。
-3. 会话内隔离检索和复习上下文注入。
-4. Agent 架构、数据库设计、产品规划、代码落地都在同一项目里体现。
-
-## 后续建议
-
-优先建议继续做这几件事：
-
-1. 补 `requirements.txt`
-2. 接通测验模式
-3. 接通学习计划页面
-4. 加一份演示脚本
-5. 补项目截图和最终项目说明文档
+1. `requirements.txt` 及正式安装文档。
+2. 测验模块前后端闭环。
+3. 学习计划模块前后端闭环。
+4. 每日学习报告与评测闭环。
+5. 更完整的工程化测试与日志观测。
 
 ## 相关文档
 
-1. [学习辅助Agent项目改造计划.md](学习辅助Agent项目改造计划.md)
+1. [阶段性完成报告.md](阶段性完成报告.md)
 2. [产品功能清单与优先级.md](产品功能清单与优先级.md)
-3. [数据库表结构设计.md](数据库表结构设计.md)
-4. [多Agent架构图.md](多Agent架构图.md)
-5. [第一阶段实施任务拆解.md](第一阶段实施任务拆解.md)
+3. [第一阶段实施任务拆解.md](第一阶段实施任务拆解.md)
+4. [数据库表结构设计.md](数据库表结构设计.md)
+5. [学习辅助Agent项目改造计划.md](学习辅助Agent项目改造计划.md)
