@@ -1,5 +1,6 @@
 import json
 import mimetypes
+from datetime import datetime
 
 import requests
 import streamlit as st
@@ -17,6 +18,12 @@ SUMMARY_TYPE_LABELS = {
 SOURCE_TYPE_LABELS = {
     "upload": "文件",
     "webpage": "网页",
+}
+
+QUIZ_DIFFICULTY_OPTIONS = {
+    "简单": "easy",
+    "中等": "medium",
+    "困难": "hard",
 }
 
 
@@ -47,6 +54,15 @@ def extract_error_message(response: requests.Response) -> str:
     except Exception:
         return response.text or "请求失败。"
     return payload.get("detail") or payload.get("message") or response.text or "请求失败。"
+
+
+def reset_cached_views():
+    st.session_state["quiz_bundle"] = None
+    st.session_state["quiz_session_id"] = None
+    st.session_state["quiz_attempt"] = None
+    st.session_state["quiz_attempt_session_id"] = None
+    st.session_state["report_data"] = None
+    st.session_state["report_session_id"] = None
 
 
 def refresh_sessions():
@@ -81,12 +97,35 @@ def parse_metadata(metadata_json: str | None) -> dict:
 def select_session(session_id: int | None):
     st.session_state["selected_session_id"] = session_id
     st.session_state["messages"] = []
+    reset_cached_views()
     if session_id is None:
         st.session_state["session_detail"] = None
         set_query_param("session_id", None)
         return
     set_query_param("session_id", session_id)
     load_session_detail(session_id)
+
+
+def create_blank_session():
+    session_name = st.session_state.get("new_session_name_input", "").strip()
+    if not session_name:
+        session_name = f"空白学习会话 {datetime.now().strftime('%m-%d %H:%M')}"
+
+    payload = {
+        "user_id": st.session_state["user_id"],
+        "session_name": session_name,
+        "topic": "",
+        "goal": "",
+        "tags": [],
+    }
+    response = requests.post(f"{API_BASE_URL}/study_sessions", json=payload, timeout=30)
+    if response.ok:
+        created = response.json()["session"]
+        st.session_state["new_session_name_input"] = ""
+        select_session(created["id"])
+        st.success("已创建空白学习会话。")
+    else:
+        st.error(extract_error_message(response))
 
 
 def build_file_payload(uploaded_files):
@@ -109,7 +148,7 @@ def import_uploaded_files(auto_create: bool, uploaded_files):
         if response.ok:
             created = response.json()["session"]
             select_session(created["id"])
-            st.success("已根据上传资料自动创建学习会话。")
+            st.success("已根据上传资料新建学习会话。")
         else:
             st.error(extract_error_message(response))
         return
@@ -122,7 +161,7 @@ def import_uploaded_files(auto_create: bool, uploaded_files):
     )
     if response.ok:
         load_session_detail(st.session_state["selected_session_id"])
-        st.success("学习资料已导入，系统已同步更新会话信息。")
+        st.success("学习资料已导入当前会话。")
     else:
         st.error(extract_error_message(response))
 
@@ -141,7 +180,7 @@ def import_webpage(url: str, auto_create: bool):
         if response.ok:
             created = response.json()["session"]
             select_session(created["id"])
-            st.success("已根据网页内容自动创建学习会话。")
+            st.success("已根据网页内容新建学习会话。")
         else:
             st.error(extract_error_message(response))
         return
@@ -226,6 +265,76 @@ def stream_study_question(user_query: str, container):
     )
 
 
+def generate_quiz(question_count: int, difficulty_label: str):
+    payload = {
+        "user_id": st.session_state["user_id"],
+        "question_count": question_count,
+        "difficulty": QUIZ_DIFFICULTY_OPTIONS[difficulty_label],
+    }
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/quiz_sets",
+        json=payload,
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["quiz_bundle"] = response.json()
+        st.session_state["quiz_session_id"] = st.session_state["selected_session_id"]
+        st.session_state["quiz_attempt"] = None
+        st.session_state["quiz_attempt_session_id"] = st.session_state["selected_session_id"]
+        st.success("已生成一套新的自测题。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def load_latest_quiz():
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/quiz_sets/latest",
+        timeout=30,
+    )
+    if response.ok:
+        payload = response.json().get("quiz")
+        st.session_state["quiz_bundle"] = payload
+        st.session_state["quiz_session_id"] = st.session_state["selected_session_id"]
+        if payload:
+            st.success("已加载最近一次测验。")
+        else:
+            st.info("当前会话还没有测验，先生成一套吧。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def submit_quiz_answers(quiz_set_id: int, answers: list[str]):
+    payload = {
+        "user_id": st.session_state["user_id"],
+        "quiz_set_id": quiz_set_id,
+        "answers": answers,
+    }
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/quiz_attempts",
+        json=payload,
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["quiz_attempt"] = response.json()
+        st.session_state["quiz_attempt_session_id"] = st.session_state["selected_session_id"]
+        st.success("测验已提交，评分结果如下。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def refresh_learning_report():
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/report",
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["report_data"] = response.json()["report"]
+        st.session_state["report_session_id"] = st.session_state["selected_session_id"]
+        st.success("学习报告已刷新。")
+    else:
+        st.error(extract_error_message(response))
+
+
 def render_sources(sources: list[dict]):
     if not sources:
         return
@@ -243,6 +352,24 @@ def render_review_items(review_items: list[dict]):
     with st.expander("复习提醒"):
         for item in review_items:
             st.caption(f"{item['topic']}: {item['summary']}")
+
+
+def get_current_quiz_bundle():
+    if st.session_state.get("quiz_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("quiz_bundle")
+    return None
+
+
+def get_current_quiz_attempt():
+    if st.session_state.get("quiz_attempt_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("quiz_attempt")
+    return None
+
+
+def get_current_report():
+    if st.session_state.get("report_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("report_data")
+    return None
 
 
 st.set_page_config(page_title="LearnOS", layout="wide")
@@ -287,6 +414,20 @@ if "selected_session_id" not in st.session_state:
     st.session_state["selected_session_id"] = int(session_id_from_query) if session_id_from_query else None
 if "session_detail" not in st.session_state:
     st.session_state["session_detail"] = None
+if "quiz_bundle" not in st.session_state:
+    st.session_state["quiz_bundle"] = None
+if "quiz_session_id" not in st.session_state:
+    st.session_state["quiz_session_id"] = None
+if "quiz_attempt" not in st.session_state:
+    st.session_state["quiz_attempt"] = None
+if "quiz_attempt_session_id" not in st.session_state:
+    st.session_state["quiz_attempt_session_id"] = None
+if "report_data" not in st.session_state:
+    st.session_state["report_data"] = None
+if "report_session_id" not in st.session_state:
+    st.session_state["report_session_id"] = None
+if "new_session_name_input" not in st.session_state:
+    st.session_state["new_session_name_input"] = ""
 
 
 with st.sidebar:
@@ -299,11 +440,11 @@ with st.sidebar:
 
     if sessions:
         options = {f"{item['session_name']} (#{item['id']})": item["id"] for item in sessions}
+        labels = list(options.keys())
         default_label = next(
             (label for label, value in options.items() if value == st.session_state["selected_session_id"]),
-            None,
+            labels[0] if labels else None,
         )
-        labels = list(options.keys())
         selected_label = st.selectbox(
             "选择学习会话",
             options=labels,
@@ -313,15 +454,21 @@ with st.sidebar:
         if selected_session_id != st.session_state["selected_session_id"]:
             select_session(selected_session_id)
         elif st.session_state["session_detail"] is None:
-            set_query_param("session_id", selected_session_id)
-            load_session_detail(selected_session_id)
+            select_session(selected_session_id)
 
         if st.button("删除当前会话", use_container_width=True):
             delete_selected_session()
             st.rerun()
     else:
-        st.caption("当前还没有学习会话，导入资料后会自动创建。")
+        st.caption("当前还没有学习会话。")
         set_query_param("session_id", None)
+        st.session_state["selected_session_id"] = None
+        st.session_state["session_detail"] = None
+
+    st.markdown("### 新建空白会话")
+    st.text_input("空白会话名称（可选）", key="new_session_name_input", placeholder="例如：MySQL 锁机制速记")
+    if st.button("新建空白学习会话", use_container_width=True):
+        create_blank_session()
 
     st.markdown("### 文件导入")
     uploaded_files = st.file_uploader(
@@ -329,7 +476,6 @@ with st.sidebar:
         type=["pdf", "docx", "txt", "md"],
         accept_multiple_files=True,
     )
-
     if st.button("根据上传资料新建学习会话", disabled=not uploaded_files, use_container_width=True):
         import_uploaded_files(auto_create=True, uploaded_files=uploaded_files)
     if st.button(
@@ -344,7 +490,6 @@ with st.sidebar:
         "学习网页链接",
         placeholder="例如：https://xiaolincoding.com/mysql/lock/how_to_lock.html",
     )
-
     if st.button("根据网页内容新建学习会话", disabled=not webpage_url.strip(), use_container_width=True):
         import_webpage(webpage_url, auto_create=True)
     if st.button(
@@ -414,40 +559,138 @@ with st.expander("会话概览", expanded=False):
         else:
             st.caption("当前还没有复习项。")
     else:
-        st.info("请先上传学习资料或导入网页，系统会自动创建会话。")
+        st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-st.subheader("学习问答")
+chat_tab, quiz_tab, report_tab = st.tabs(["学习问答", "测验模式", "学习报告"])
 
-messages_container = st.container()
-with messages_container:
-    for message in st.session_state["messages"]:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-            render_sources(message.get("sources", []))
-            render_review_items(message.get("review_items", []))
+with chat_tab:
+    st.subheader("学习问答")
+    messages_container = st.container()
+    with messages_container:
+        for message in st.session_state["messages"]:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+                render_sources(message.get("sources", []))
+                render_review_items(message.get("review_items", []))
 
-streaming_container = st.container()
+    streaming_container = st.container()
 
-with st.form("chat_input_form", clear_on_submit=True):
-    submitted_query = st.text_input(
-        "学习提问",
-        placeholder="围绕今天的学习资料提问...",
-        label_visibility="collapsed",
-        disabled=st.session_state["selected_session_id"] is None,
-    )
-    submitted = st.form_submit_button(
-        "发送",
-        disabled=st.session_state["selected_session_id"] is None,
-    )
+    with st.form("chat_input_form", clear_on_submit=True):
+        submitted_query = st.text_input(
+            "学习提问",
+            placeholder="围绕今天的学习资料提问...",
+            label_visibility="collapsed",
+            disabled=st.session_state["selected_session_id"] is None,
+        )
+        submitted = st.form_submit_button(
+            "发送",
+            disabled=st.session_state["selected_session_id"] is None,
+        )
 
-if st.session_state["selected_session_id"] is None:
-    st.caption("先导入资料后再开始提问。")
+    if st.session_state["selected_session_id"] is None:
+        st.caption("先新建会话或导入资料后再开始提问。")
 
-user_query = submitted_query.strip()
-if submitted and st.session_state["selected_session_id"] is not None and user_query:
-    try:
-        with st.spinner("正在整理回答..."):
-            stream_study_question(user_query, streaming_container)
-    except Exception as exc:
-        st.error(f"请求失败：{exc}")
+    user_query = submitted_query.strip()
+    if submitted and st.session_state["selected_session_id"] is not None and user_query:
+        try:
+            with st.spinner("正在整理回答..."):
+                stream_study_question(user_query, streaming_container)
+        except Exception as exc:
+            st.error(f"请求失败：{exc}")
+
+with quiz_tab:
+    st.subheader("测验模式")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再开始自测。")
+    else:
+        quiz_col1, quiz_col2 = st.columns([1, 1])
+        with quiz_col1:
+            question_count = st.slider("题目数量", min_value=2, max_value=6, value=3)
+        with quiz_col2:
+            difficulty_label = st.selectbox("难度", options=list(QUIZ_DIFFICULTY_OPTIONS.keys()), index=1)
+
+        action_col1, action_col2 = st.columns([1, 1])
+        with action_col1:
+            if st.button("生成新测验", use_container_width=True):
+                generate_quiz(question_count=question_count, difficulty_label=difficulty_label)
+        with action_col2:
+            if st.button("加载最近一次测验", use_container_width=True):
+                load_latest_quiz()
+
+        quiz_bundle = get_current_quiz_bundle()
+        if quiz_bundle:
+            st.markdown(f"**{quiz_bundle['title']}**")
+            st.caption(f"难度：{quiz_bundle.get('difficulty', 'medium')} | 题目数：{len(quiz_bundle.get('questions', []))}")
+            if quiz_bundle.get("instructions"):
+                st.write(quiz_bundle["instructions"])
+
+            answers = []
+            for index, question in enumerate(quiz_bundle.get("questions", []), start=1):
+                st.markdown(f"**第 {index} 题**")
+                st.write(question.get("question_text", ""))
+                answers.append(
+                    st.text_area(
+                        f"answer_{quiz_bundle['quiz_set_id']}_{index}",
+                        key=f"quiz_answer_{quiz_bundle['quiz_set_id']}_{index}",
+                        label_visibility="collapsed",
+                        placeholder="在这里写下你的回答...",
+                        height=120,
+                    )
+                )
+
+            if st.button("提交测验并评分", key=f"submit_quiz_{quiz_bundle['quiz_set_id']}", use_container_width=True):
+                submit_quiz_answers(quiz_bundle["quiz_set_id"], answers)
+
+        quiz_attempt = get_current_quiz_attempt()
+        if quiz_attempt:
+            result = quiz_attempt.get("result", quiz_attempt.get("result", {})) or quiz_attempt.get("result", {})
+            if not result and "result" not in quiz_attempt:
+                result = quiz_attempt
+            st.divider()
+            st.markdown("**最近一次评分结果**")
+            st.write(f"总分：{result.get('total_score', 0)} / {result.get('max_total_score', 0)}")
+            st.caption(result.get("overall_feedback", ""))
+            for item in result.get("item_feedback", []):
+                st.markdown(f"**第 {item.get('question_index')} 题：{item.get('score')} / {item.get('max_score')}**")
+                st.write(item.get("feedback", ""))
+                if item.get("suggestion"):
+                    st.caption(f"建议：{item['suggestion']}")
+
+with report_tab:
+    st.subheader("学习报告")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再生成学习报告。")
+    else:
+        if st.button("生成 / 刷新学习报告", use_container_width=True):
+            refresh_learning_report()
+
+        report = get_current_report()
+        if report:
+            st.markdown(f"**{report.get('title', '学习报告')}**")
+            st.write(report.get("overview", ""))
+
+            left_col, right_col = st.columns(2)
+            with left_col:
+                st.markdown("**进展快照**")
+                for item in report.get("progress_snapshot", []):
+                    st.write(f"- {item}")
+
+                st.markdown("**当前优势**")
+                for item in report.get("strengths", []):
+                    st.write(f"- {item}")
+
+                st.markdown("**面试表达重点**")
+                for item in report.get("interview_focus", []):
+                    st.write(f"- {item}")
+
+            with right_col:
+                st.markdown("**当前风险**")
+                for item in report.get("risks", []):
+                    st.write(f"- {item}")
+
+                st.markdown("**下一步建议**")
+                for item in report.get("next_actions", []):
+                    st.write(f"- {item}")
+        else:
+            st.caption("点击上方按钮生成当前学习会话的复盘报告。")

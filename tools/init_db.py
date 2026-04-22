@@ -121,12 +121,59 @@ def init_study_db() -> str:
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quiz_sets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            question_count INTEGER DEFAULT 3,
+            difficulty TEXT DEFAULT 'medium',
+            source_type TEXT DEFAULT 'generated',
+            metadata_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quiz_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_set_id INTEGER NOT NULL,
+            question_index INTEGER NOT NULL,
+            question_type TEXT,
+            question_text TEXT NOT NULL,
+            reference_answer TEXT,
+            scoring_rubric TEXT,
+            metadata_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_set_id INTEGER NOT NULL,
+            session_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            answers_json TEXT,
+            result_json TEXT,
+            total_score REAL DEFAULT 0,
+            feedback_text TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_date ON study_sessions(user_id, session_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_documents_session_id ON study_documents(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_session_id ON knowledge_points(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_review_user_next_review ON review_items(user_id, next_review_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_sets_session_id ON quiz_sets(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_questions_set_id ON quiz_questions(quiz_set_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_attempts_session_user ON quiz_attempts(session_id, user_id)")
 
     _ensure_column(cursor, "study_documents", "source_type", "TEXT DEFAULT 'upload'")
     _ensure_column(cursor, "study_documents", "metadata_json", "TEXT")

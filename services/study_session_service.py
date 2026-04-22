@@ -84,6 +84,12 @@ def delete_study_session(session_id: int, user_id: str) -> bool:
         conn.close()
         return False
 
+    cursor.execute("DELETE FROM quiz_attempts WHERE session_id = ?", (session_id,))
+    cursor.execute(
+        "DELETE FROM quiz_questions WHERE quiz_set_id IN (SELECT id FROM quiz_sets WHERE session_id = ?)",
+        (session_id,),
+    )
+    cursor.execute("DELETE FROM quiz_sets WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM review_items WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM knowledge_points WHERE session_id = ?", (session_id,))
     cursor.execute(

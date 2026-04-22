@@ -35,6 +35,17 @@ from services.document_service import (
     save_document_summary,
     save_knowledge_points,
 )
+from services.quiz_service import (
+    create_quiz_set,
+    generate_quiz_bundle,
+    get_latest_quiz_attempt_for_session,
+    get_latest_quiz_for_session,
+    get_quiz_set_with_questions,
+    grade_quiz_attempt,
+    save_quiz_attempt,
+    save_quiz_questions,
+)
+from services.report_service import generate_session_report
 from services.review_service import build_review_context, create_review_items_from_knowledge_points, get_review_items_for_session
 from services.study_session_service import create_study_session, delete_study_session, get_study_session, list_study_sessions, update_study_session
 from services.summary_service import infer_session_metadata, summarize_text
@@ -83,6 +94,18 @@ class WebpageImportRequest(BaseModel):
 
 class SessionDeleteRequest(BaseModel):
     user_id: str
+
+
+class QuizGenerateRequest(BaseModel):
+    user_id: str
+    question_count: int = 3
+    difficulty: str = "medium"
+
+
+class QuizSubmitRequest(BaseModel):
+    user_id: str
+    quiz_set_id: int
+    answers: list[str]
 
 
 def _ingest_text_resource(
@@ -299,6 +322,57 @@ def _build_session_retriever(session_id: int):
     return retriever, doc_chunks
 
 
+def _build_quiz_bundle_for_session(session_id: int, question_count: int, difficulty: str):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    knowledge_points = get_session_knowledge_points(session_id)
+    summaries = get_session_summaries(session_id)
+    generated = generate_quiz_bundle(
+        session=session,
+        knowledge_points=knowledge_points,
+        summaries=summaries,
+        llm_generator=llm_generator,
+        question_count=question_count,
+        difficulty=difficulty,
+    )
+    quiz_set_id = create_quiz_set(
+        session_id=session_id,
+        title=generated["title"],
+        question_count=len(generated["questions"]),
+        difficulty=generated["difficulty"],
+        metadata={"instructions": generated.get("instructions", "")},
+    )
+    save_quiz_questions(quiz_set_id, generated["questions"])
+    stored = get_quiz_set_with_questions(quiz_set_id)
+    return {
+        "quiz_set_id": quiz_set_id,
+        "title": generated["title"],
+        "difficulty": generated["difficulty"],
+        "instructions": generated.get("instructions", ""),
+        "questions": stored["questions"] if stored else generated["questions"],
+    }
+
+
+def _build_learning_report(session_id: int):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    report = generate_session_report(
+        session=session,
+        documents=get_session_documents(session_id),
+        summaries=get_session_summaries(session_id),
+        knowledge_points=get_session_knowledge_points(session_id),
+        review_items=get_review_items_for_session(session_id),
+        history=get_user_history(session["user_id"], session_id=session_id),
+        latest_quiz_attempt=get_latest_quiz_attempt_for_session(session_id, session["user_id"]),
+        llm_generator=llm_generator,
+    )
+    return {"session_id": session_id, "report": report}
+
+
 def _delete_session_resources(session_id: int, user_id: str):
     if not get_study_session(session_id):
         raise HTTPException(status_code=404, detail="Study session not found.")
@@ -382,6 +456,11 @@ async def delete_session_endpoint(session_id: int, request: SessionDeleteRequest
     return _delete_session_resources(session_id=session_id, user_id=request.user_id)
 
 
+@app.get("/study_sessions/{session_id}/report")
+async def get_session_report_endpoint(session_id: int):
+    return _build_learning_report(session_id)
+
+
 @app.post("/study_sessions/{session_id}/documents")
 async def upload_documents_endpoint(
     session_id: int,
@@ -441,6 +520,60 @@ async def auto_create_session_from_webpage_endpoint(request: WebpageImportReques
         "session": result["session"],
         "documents": result["documents"],
     }
+
+
+@app.post("/study_sessions/{session_id}/quiz_sets")
+async def generate_quiz_endpoint(session_id: int, request: QuizGenerateRequest):
+    return _build_quiz_bundle_for_session(
+        session_id=session_id,
+        question_count=request.question_count,
+        difficulty=request.difficulty,
+    )
+
+
+@app.get("/study_sessions/{session_id}/quiz_sets/latest")
+async def get_latest_quiz_endpoint(session_id: int):
+    latest = get_latest_quiz_for_session(session_id)
+    if latest is None:
+        return {"quiz": None}
+
+    metadata = json.loads(latest["quiz_set"].get("metadata_json") or "{}")
+    return {
+        "quiz": {
+            "quiz_set_id": latest["quiz_set"]["id"],
+            "title": latest["quiz_set"]["title"],
+            "difficulty": latest["quiz_set"]["difficulty"],
+            "instructions": metadata.get("instructions", ""),
+            "questions": latest["questions"],
+        }
+    }
+
+
+@app.post("/study_sessions/{session_id}/quiz_attempts")
+async def submit_quiz_endpoint(session_id: int, request: QuizSubmitRequest):
+    stored = get_quiz_set_with_questions(request.quiz_set_id)
+    if stored is None or stored["quiz_set"]["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail="Quiz not found for this session.")
+
+    result = grade_quiz_attempt(
+        questions=stored["questions"],
+        answers=request.answers,
+        llm_generator=llm_generator,
+    )
+    attempt_id = save_quiz_attempt(
+        quiz_set_id=request.quiz_set_id,
+        session_id=session_id,
+        user_id=request.user_id,
+        answers=request.answers,
+        result=result,
+    )
+    return {"attempt_id": attempt_id, "result": result}
+
+
+@app.get("/study_sessions/{session_id}/quiz_attempts/latest")
+async def get_latest_quiz_attempt_endpoint(session_id: int, user_id: str = Query(...)):
+    attempt = get_latest_quiz_attempt_for_session(session_id, user_id)
+    return {"attempt": attempt}
 
 
 @app.post("/agent_chat")
