@@ -1,6 +1,6 @@
 import re
 from html import unescape
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
@@ -37,6 +37,8 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 MULTI_BLANK_PATTERN = re.compile(r"\n{3,}")
 TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 H1_PATTERN = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+ANCHOR_HREF_PATTERN = re.compile(r"<a[^>]+href=['\"](.*?)['\"]", re.IGNORECASE)
+BLOCKED_LINK_TOKENS = {"tag", "tags", "category", "categories", "about", "archive", "archives", "search", "feed"}
 
 
 def fetch_webpage_content(url: str, timeout: int = 20) -> dict:
@@ -75,6 +77,50 @@ def fetch_webpage_content(url: str, timeout: int = 20) -> dict:
         "text": content,
         "source_url": response.url,
         "site_name": parsed.netloc,
+    }
+
+
+def fetch_webpage_batch(url: str, max_pages: int = 5, timeout: int = 20) -> dict:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only http/https URLs are supported.")
+
+    response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    html = _decode_html(response)
+    source_url = response.url
+    site_name = urlparse(source_url).netloc
+
+    candidate_urls = _extract_same_site_links(html, base_url=source_url)
+    ranked_urls = sorted(candidate_urls, key=lambda item: _score_candidate_url(item, source_url), reverse=True)
+    selected_urls = []
+    seen = set()
+    for candidate in ranked_urls:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        selected_urls.append(candidate)
+        if len(selected_urls) >= max(1, int(max_pages or 5)):
+            break
+
+    pages = []
+    if not selected_urls and _is_probable_article_url(source_url, source_url):
+        selected_urls = [source_url]
+
+    for candidate in selected_urls:
+        try:
+            pages.append(fetch_webpage_content(candidate, timeout=timeout))
+        except Exception:
+            continue
+
+    if not pages:
+        raise ValueError("Unable to discover readable same-site articles from the provided webpage.")
+
+    return {
+        "source_url": source_url,
+        "site_name": site_name,
+        "pages": pages,
+        "discovered_urls": selected_urls,
     }
 
 
@@ -158,6 +204,81 @@ def _extract_with_bs4(html: str) -> tuple[str, str]:
             pieces.append(fallback_text)
 
     return title, "\n\n".join(pieces)
+
+
+def _extract_same_site_links(html: str, base_url: str) -> list[str]:
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html, "html.parser")
+        hrefs = [tag.get("href", "") for tag in soup.find_all("a")]
+    else:
+        hrefs = ANCHOR_HREF_PATTERN.findall(html)
+
+    links = []
+    for href in hrefs:
+        normalized = _normalize_candidate_url(base_url, href)
+        if normalized and _is_probable_article_url(normalized, base_url):
+            links.append(normalized)
+    return links
+
+
+def _normalize_candidate_url(base_url: str, href: str) -> str:
+    href = (href or "").strip()
+    if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return ""
+
+    absolute = urljoin(base_url, href)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if parsed.netloc != urlparse(base_url).netloc:
+        return ""
+
+    normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") or "/", "", "", ""))
+    return normalized
+
+
+def _is_probable_article_url(candidate_url: str, base_url: str) -> bool:
+    parsed = urlparse(candidate_url)
+    base_parsed = urlparse(base_url)
+    if parsed.netloc != base_parsed.netloc:
+        return False
+
+    path = parsed.path.lower().strip("/")
+    if not path:
+        return False
+    if any(token in path.split("/") for token in BLOCKED_LINK_TOKENS):
+        return False
+    if any(path.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".svg", ".css", ".js", ".xml", ".pdf", ".zip"]):
+        return False
+
+    segments = [segment for segment in path.split("/") if segment]
+    if path.endswith((".html", ".htm", ".md")):
+        return True
+    return len(segments) >= 2
+
+
+def _score_candidate_url(candidate_url: str, base_url: str) -> tuple[int, int]:
+    candidate_path = urlparse(candidate_url).path.lower().strip("/")
+    base_path = urlparse(base_url).path.lower().strip("/")
+    candidate_segments = [segment for segment in candidate_path.split("/") if segment]
+    base_segments = [segment for segment in base_path.split("/") if segment]
+
+    shared_prefix = 0
+    for left, right in zip(candidate_segments, base_segments):
+        if left != right:
+            break
+        shared_prefix += 1
+
+    score = 0
+    if candidate_path.endswith(".html"):
+        score += 4
+    if candidate_path.endswith(".htm"):
+        score += 3
+    score += min(shared_prefix, 3) * 2
+    score += min(len(candidate_segments), 5)
+    if any(token in candidate_segments for token in BLOCKED_LINK_TOKENS):
+        score -= 5
+    return score, len(candidate_path)
 
 
 def _extract_title_with_regex(html: str) -> str:

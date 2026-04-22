@@ -61,6 +61,8 @@ def reset_cached_views():
     st.session_state["quiz_session_id"] = None
     st.session_state["quiz_attempt"] = None
     st.session_state["quiz_attempt_session_id"] = None
+    st.session_state["plan_data"] = None
+    st.session_state["plan_session_id"] = None
     st.session_state["report_data"] = None
     st.session_state["report_session_id"] = None
 
@@ -197,6 +199,40 @@ def import_webpage(url: str, auto_create: bool):
         st.error(extract_error_message(response))
 
 
+def import_webpage_batch(url: str, max_pages: int, auto_create: bool):
+    payload = {
+        "user_id": st.session_state["user_id"],
+        "url": url.strip(),
+        "max_pages": int(max_pages),
+    }
+    if auto_create:
+        response = requests.post(
+            f"{API_BASE_URL}/study_sessions/auto_from_webpage_batch",
+            json=payload,
+            timeout=240,
+        )
+        if response.ok:
+            created = response.json()["session"]
+            imported_count = int(response.json().get("imported_count", 0) or 0)
+            select_session(created["id"])
+            st.success(f"已根据目录页批量新建学习会话，共导入 {imported_count} 篇网页。")
+        else:
+            st.error(extract_error_message(response))
+        return
+
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/webpages/batch",
+        json=payload,
+        timeout=240,
+    )
+    if response.ok:
+        imported_count = int(response.json().get("imported_count", 0) or 0)
+        load_session_detail(st.session_state["selected_session_id"])
+        st.success(f"已批量导入 {imported_count} 篇网页到当前会话。")
+    else:
+        st.error(extract_error_message(response))
+
+
 def delete_selected_session():
     session_id = st.session_state.get("selected_session_id")
     if session_id is None:
@@ -315,9 +351,15 @@ def submit_quiz_answers(quiz_set_id: int, answers: list[str]):
         timeout=120,
     )
     if response.ok:
-        st.session_state["quiz_attempt"] = response.json()
+        payload = response.json()
+        st.session_state["quiz_attempt"] = payload
         st.session_state["quiz_attempt_session_id"] = st.session_state["selected_session_id"]
-        st.success("测验已提交，评分结果如下。")
+        load_session_detail(st.session_state["selected_session_id"])
+        created_count = int(payload.get("review_items_created", 0) or 0)
+        if created_count > 0:
+            st.success(f"测验已提交，评分结果如下。系统已新增 {created_count} 条高优先级复习项。")
+        else:
+            st.success("测验已提交，评分结果如下。")
     else:
         st.error(extract_error_message(response))
 
@@ -331,6 +373,19 @@ def refresh_learning_report():
         st.session_state["report_data"] = response.json()["report"]
         st.session_state["report_session_id"] = st.session_state["selected_session_id"]
         st.success("学习报告已刷新。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def refresh_learning_plan():
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/plan",
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["plan_data"] = response.json()["plan"]
+        st.session_state["plan_session_id"] = st.session_state["selected_session_id"]
+        st.success("学习计划已刷新。")
     else:
         st.error(extract_error_message(response))
 
@@ -369,6 +424,12 @@ def get_current_quiz_attempt():
 def get_current_report():
     if st.session_state.get("report_session_id") == st.session_state.get("selected_session_id"):
         return st.session_state.get("report_data")
+    return None
+
+
+def get_current_plan():
+    if st.session_state.get("plan_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("plan_data")
     return None
 
 
@@ -426,6 +487,10 @@ if "report_data" not in st.session_state:
     st.session_state["report_data"] = None
 if "report_session_id" not in st.session_state:
     st.session_state["report_session_id"] = None
+if "plan_data" not in st.session_state:
+    st.session_state["plan_data"] = None
+if "plan_session_id" not in st.session_state:
+    st.session_state["plan_session_id"] = None
 if "new_session_name_input" not in st.session_state:
     st.session_state["new_session_name_input"] = ""
 
@@ -499,6 +564,21 @@ with st.sidebar:
     ):
         import_webpage(webpage_url, auto_create=False)
 
+    st.markdown("### 批量网页导入")
+    batch_webpage_url = st.text_input(
+        "目录页链接",
+        placeholder="例如：https://xiaolincoding.com/mysql/",
+    )
+    batch_max_pages = st.slider("最多导入篇数", min_value=2, max_value=10, value=5)
+    if st.button("根据目录页批量新建学习会话", disabled=not batch_webpage_url.strip(), use_container_width=True):
+        import_webpage_batch(batch_webpage_url, max_pages=batch_max_pages, auto_create=True)
+    if st.button(
+        "批量导入网页到当前会话",
+        disabled=not batch_webpage_url.strip() or st.session_state["selected_session_id"] is None,
+        use_container_width=True,
+    ):
+        import_webpage_batch(batch_webpage_url, max_pages=batch_max_pages, auto_create=False)
+
     st.caption(f"当前用户标识：{st.session_state['user_id']}")
 
 
@@ -562,7 +642,7 @@ with st.expander("会话概览", expanded=False):
         st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-chat_tab, quiz_tab, report_tab = st.tabs(["学习问答", "测验模式", "学习报告"])
+chat_tab, quiz_tab, plan_tab, report_tab = st.tabs(["学习问答", "测验模式", "学习计划", "学习报告"])
 
 with chat_tab:
     st.subheader("学习问答")
@@ -694,3 +774,37 @@ with report_tab:
                     st.write(f"- {item}")
         else:
             st.caption("点击上方按钮生成当前学习会话的复盘报告。")
+
+with plan_tab:
+    st.subheader("学习计划")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再生成学习计划。")
+    else:
+        if st.button("生成 / 刷新学习计划", use_container_width=True):
+            refresh_learning_plan()
+
+        plan = get_current_plan()
+        if plan:
+            st.markdown(f"**{plan.get('title', '学习计划')}**")
+            st.write(plan.get("overview", ""))
+
+            plan_col1, plan_col2 = st.columns(2)
+            with plan_col1:
+                st.markdown("**今天学什么**")
+                for item in plan.get("today_focus", []):
+                    st.write(f"- {item}")
+
+                st.markdown("**先复习什么**")
+                for item in plan.get("priority_review", []):
+                    st.write(f"- {item}")
+
+            with plan_col2:
+                st.markdown("**下一步问什么**")
+                for item in plan.get("next_questions", []):
+                    st.write(f"- {item}")
+
+                st.markdown("**行动步骤**")
+                for item in plan.get("action_steps", []):
+                    st.write(f"- {item}")
+        else:
+            st.caption("点击上方按钮，基于当前会话的知识点、复习项和测验结果生成计划。")

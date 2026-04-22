@@ -35,6 +35,7 @@ from services.document_service import (
     save_document_summary,
     save_knowledge_points,
 )
+from services.plan_service import generate_learning_plan
 from services.quiz_service import (
     create_quiz_set,
     generate_quiz_bundle,
@@ -46,10 +47,15 @@ from services.quiz_service import (
     save_quiz_questions,
 )
 from services.report_service import generate_session_report
-from services.review_service import build_review_context, create_review_items_from_knowledge_points, get_review_items_for_session
+from services.review_service import (
+    build_review_context,
+    create_review_items_from_knowledge_points,
+    create_review_items_from_quiz_feedback,
+    get_review_items_for_session,
+)
 from services.study_session_service import create_study_session, delete_study_session, get_study_session, list_study_sessions, update_study_session
 from services.summary_service import infer_session_metadata, summarize_text
-from services.webpage_service import fetch_webpage_content
+from services.webpage_service import fetch_webpage_batch, fetch_webpage_content
 from tools.init_db import init_study_db
 
 
@@ -90,6 +96,12 @@ class ChatRequest(BaseModel):
 class WebpageImportRequest(BaseModel):
     user_id: str
     url: str
+
+
+class BatchWebpageImportRequest(BaseModel):
+    user_id: str
+    url: str
+    max_pages: int = 5
 
 
 class SessionDeleteRequest(BaseModel):
@@ -306,6 +318,50 @@ def _ingest_webpage_for_session(session_id: int, user_id: str, url: str):
     return {"session": updated_session, "documents": [created_document], "webpage": webpage}
 
 
+def _ingest_webpage_batch_for_session(session_id: int, user_id: str, url: str, max_pages: int):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    try:
+        batch = fetch_webpage_batch(url, max_pages=max_pages)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        raise HTTPException(status_code=status_code, detail=f"Failed to fetch webpage batch: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to import webpage batch: {exc}")
+
+    created_documents = []
+    file_names = []
+    merged_text_parts = []
+
+    for page in batch["pages"]:
+        created_document, display_name, preview_text = _ingest_text_resource(
+            session_id=session_id,
+            user_id=user_id,
+            title=page["title"],
+            file_name=page["source_url"],
+            file_path=page["source_url"],
+            file_type="url",
+            file_size=len(page["text"].encode("utf-8")),
+            text=page["text"],
+            source_type="webpage",
+            metadata={
+                "source": page["source_url"],
+                "source_url": page["source_url"],
+                "site_name": page["site_name"],
+                "import_mode": "batch_webpage",
+                "batch_source_url": batch["source_url"],
+            },
+        )
+        created_documents.append(created_document)
+        file_names.append(display_name)
+        merged_text_parts.append(preview_text)
+
+    updated_session = _refresh_session_metadata(session_id, file_names, merged_text_parts)
+    return {"session": updated_session, "documents": created_documents, "batch": batch}
+
+
 def _build_session_retriever(session_id: int):
     where = {"session_id": str(session_id)}
     doc_chunks = vector_store.get_all_documents(where=where)
@@ -371,6 +427,22 @@ def _build_learning_report(session_id: int):
         llm_generator=llm_generator,
     )
     return {"session_id": session_id, "report": report}
+
+
+def _build_learning_plan(session_id: int):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    plan = generate_learning_plan(
+        session=session,
+        knowledge_points=get_session_knowledge_points(session_id),
+        review_items=get_review_items_for_session(session_id),
+        history=get_user_history(session["user_id"], session_id=session_id),
+        latest_quiz_attempt=get_latest_quiz_attempt_for_session(session_id, session["user_id"]),
+        llm_generator=llm_generator,
+    )
+    return {"session_id": session_id, "plan": plan}
 
 
 def _delete_session_resources(session_id: int, user_id: str):
@@ -461,6 +533,11 @@ async def get_session_report_endpoint(session_id: int):
     return _build_learning_report(session_id)
 
 
+@app.get("/study_sessions/{session_id}/plan")
+async def get_session_plan_endpoint(session_id: int):
+    return _build_learning_plan(session_id)
+
+
 @app.post("/study_sessions/{session_id}/documents")
 async def upload_documents_endpoint(
     session_id: int,
@@ -501,6 +578,23 @@ async def import_webpage_endpoint(session_id: int, request: WebpageImportRequest
     return {"session_id": session_id, "session": result["session"], "documents": result["documents"]}
 
 
+@app.post("/study_sessions/{session_id}/webpages/batch")
+async def import_webpage_batch_endpoint(session_id: int, request: BatchWebpageImportRequest):
+    result = _ingest_webpage_batch_for_session(
+        session_id=session_id,
+        user_id=request.user_id,
+        url=request.url,
+        max_pages=request.max_pages,
+    )
+    return {
+        "session_id": session_id,
+        "session": result["session"],
+        "documents": result["documents"],
+        "imported_count": len(result["documents"]),
+        "source_url": result["batch"]["source_url"],
+    }
+
+
 @app.post("/study_sessions/auto_from_webpage")
 async def auto_create_session_from_webpage_endpoint(request: WebpageImportRequest):
     placeholder_session = create_study_session(
@@ -519,6 +613,30 @@ async def auto_create_session_from_webpage_endpoint(request: WebpageImportReques
         "session_id": placeholder_session["id"],
         "session": result["session"],
         "documents": result["documents"],
+    }
+
+
+@app.post("/study_sessions/auto_from_webpage_batch")
+async def auto_create_session_from_webpage_batch_endpoint(request: BatchWebpageImportRequest):
+    placeholder_session = create_study_session(
+        user_id=request.user_id,
+        session_name="批量网页资料整理中",
+        topic="待分析",
+        goal="等待系统根据同站网页资料自动生成学习信息。",
+        tags=[],
+    )
+    result = _ingest_webpage_batch_for_session(
+        session_id=placeholder_session["id"],
+        user_id=request.user_id,
+        url=request.url,
+        max_pages=request.max_pages,
+    )
+    return {
+        "session_id": placeholder_session["id"],
+        "session": result["session"],
+        "documents": result["documents"],
+        "imported_count": len(result["documents"]),
+        "source_url": result["batch"]["source_url"],
     }
 
 
@@ -567,7 +685,18 @@ async def submit_quiz_endpoint(session_id: int, request: QuizSubmitRequest):
         answers=request.answers,
         result=result,
     )
-    return {"attempt_id": attempt_id, "result": result}
+    created_review_topics = create_review_items_from_quiz_feedback(
+        user_id=request.user_id,
+        session_id=session_id,
+        questions=stored["questions"],
+        result=result,
+    )
+    return {
+        "attempt_id": attempt_id,
+        "result": result,
+        "review_items_created": len(created_review_topics),
+        "review_topics": created_review_topics,
+    }
 
 
 @app.get("/study_sessions/{session_id}/quiz_attempts/latest")
