@@ -1,10 +1,12 @@
 # Server.py
 import json
 import os
+import shutil
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-import sys
 
+import requests
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
@@ -20,7 +22,7 @@ from RAG.hybrid_retriever import HybridRetriever
 from RAG.text_splitter import SemanticTextSplitter
 from RAG.vector_store import ChromaDBStore
 from agent_engine import run_agent_cycle
-from chat_history_service import get_user_history, init_db, load_thread_state, save_chat_history
+from chat_history_service import delete_session_history, get_user_history, init_db, load_thread_state, save_chat_history
 from llm_generator import LLMGenerator
 from services.document_service import (
     calculate_content_hash,
@@ -34,8 +36,9 @@ from services.document_service import (
     save_knowledge_points,
 )
 from services.review_service import build_review_context, create_review_items_from_knowledge_points, get_review_items_for_session
-from services.study_session_service import create_study_session, get_study_session, list_study_sessions, update_study_session
+from services.study_session_service import create_study_session, delete_study_session, get_study_session, list_study_sessions, update_study_session
 from services.summary_service import infer_session_metadata, summarize_text
+from services.webpage_service import fetch_webpage_content
 from tools.init_db import init_study_db
 
 
@@ -73,6 +76,137 @@ class ChatRequest(BaseModel):
     query: str
 
 
+class WebpageImportRequest(BaseModel):
+    user_id: str
+    url: str
+
+
+class SessionDeleteRequest(BaseModel):
+    user_id: str
+
+
+def _ingest_text_resource(
+    session_id: int,
+    user_id: str,
+    *,
+    title: str,
+    file_name: str,
+    file_path: str,
+    file_type: str,
+    file_size: int,
+    text: str,
+    source_type: str,
+    metadata: dict | None = None,
+):
+    normalized_text = text.strip()
+    if not normalized_text:
+        raise HTTPException(status_code=400, detail=f"Resource {title} does not contain readable text.")
+
+    content_hash = calculate_content_hash(normalized_text)
+    document_id = create_document(
+        session_id=session_id,
+        title=title,
+        file_name=file_name,
+        file_path=file_path,
+        file_type=file_type,
+        file_size=file_size,
+        content_hash=content_hash,
+        source_type=source_type,
+        metadata=metadata,
+    )
+
+    splitter = SemanticTextSplitter(chunk_size=config.chunk_size, chunk_overlap=config.chunk_overlap)
+    chunks = splitter.split_text(normalized_text)
+    if not chunks:
+        chunks = [normalized_text]
+
+    source_reference = (metadata or {}).get("source_url") or (metadata or {}).get("source") or file_path
+    metadatas = []
+    ids = []
+    for chunk_index, _ in enumerate(chunks):
+        metadatas.append(
+            {
+                "source": source_reference,
+                "document_id": str(document_id),
+                "document_title": title,
+                "session_id": str(session_id),
+                "chunk_index": chunk_index,
+                "source_type": source_type,
+            }
+        )
+        ids.append(f"session_{session_id}_doc_{document_id}_chunk_{chunk_index}")
+
+    vector_store.add_documents(documents=chunks, metadatas=metadatas, ids=ids)
+    save_document_chunks(
+        document_id=document_id,
+        chunks=chunks,
+        chroma_ids=ids,
+        base_metadata={
+            "session_id": session_id,
+            "source": source_reference,
+            "source_type": source_type,
+        },
+    )
+
+    summary_bundle = summarize_text(normalized_text, llm_generator=llm_generator)
+    save_document_summary(document_id, "short_summary", summary_bundle["short_summary"])
+    save_document_summary(document_id, "keywords", ", ".join(summary_bundle["keywords"]))
+    save_document_summary(
+        document_id,
+        "interview_takeaways",
+        "\n".join(summary_bundle["interview_takeaways"]),
+    )
+
+    knowledge_point_ids = save_knowledge_points(session_id, document_id, summary_bundle["knowledge_points"])
+    create_review_items_from_knowledge_points(
+        user_id=user_id,
+        session_id=session_id,
+        knowledge_points=summary_bundle["knowledge_points"],
+        knowledge_point_ids=knowledge_point_ids,
+    )
+
+    mark_document_ingested(document_id=document_id, status="completed")
+    return (
+        {
+            "document_id": document_id,
+            "title": title,
+            "file_name": file_name,
+            "source_type": source_type,
+            "summary": summary_bundle["short_summary"],
+            "knowledge_points": summary_bundle["knowledge_points"],
+        },
+        file_name,
+        normalized_text[:5000],
+    )
+
+
+def _refresh_session_metadata(session_id: int, file_names: list[str], merged_text_parts: list[str]):
+    all_summaries = get_session_summaries(session_id)
+    overall_summary = {
+        "short_summary": "\n".join(
+            [item["summary_text"] for item in all_summaries if item["summary_type"] == "short_summary"][:3]
+        ),
+        "keywords": [],
+    }
+    for item in all_summaries:
+        if item["summary_type"] == "keywords":
+            overall_summary["keywords"].extend([part.strip() for part in item["summary_text"].split(",") if part.strip()])
+
+    metadata = infer_session_metadata(
+        file_names=file_names,
+        merged_text="\n\n".join(merged_text_parts),
+        summary_bundle=overall_summary,
+        llm_generator=llm_generator,
+    )
+    return update_study_session(
+        session_id=session_id,
+        session_name=metadata["session_name"],
+        topic=metadata["topic"],
+        goal=metadata["goal"],
+        tags=metadata.get("tags", []),
+    )
+
+
 async def _ingest_documents_for_session(session_id: int, user_id: str, files: list[UploadFile]):
     session = get_study_session(session_id)
     if not session:
@@ -96,96 +230,59 @@ async def _ingest_documents_for_session(session_id: int, user_id: str, files: li
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to read {upload.filename}: {exc}")
 
-        if not text:
-            raise HTTPException(status_code=400, detail=f"File {upload.filename} does not contain readable text.")
-
-        file_names.append(upload.filename)
-        merged_text_parts.append(text[:5000])
-
-        content_hash = calculate_content_hash(text)
-        document_id = create_document(
+        created_document, display_name, preview_text = _ingest_text_resource(
             session_id=session_id,
+            user_id=user_id,
             title=Path(upload.filename).stem,
             file_name=upload.filename,
             file_path=str(file_path),
             file_type=file_path.suffix.lower(),
             file_size=len(file_bytes),
-            content_hash=content_hash,
+            text=text,
+            source_type="upload",
             metadata={"source": str(file_path)},
         )
+        created_documents.append(created_document)
+        file_names.append(display_name)
+        merged_text_parts.append(preview_text)
 
-        splitter = SemanticTextSplitter(chunk_size=config.chunk_size, chunk_overlap=config.chunk_overlap)
-        chunks = splitter.split_text(text)
-        metadatas = []
-        ids = []
-        for chunk_index, _ in enumerate(chunks):
-            metadatas.append(
-                {
-                    "source": str(file_path),
-                    "document_id": str(document_id),
-                    "document_title": Path(upload.filename).stem,
-                    "session_id": str(session_id),
-                    "chunk_index": chunk_index,
-                }
-            )
-            ids.append(f"session_{session_id}_doc_{document_id}_chunk_{chunk_index}")
-
-        vector_store.add_documents(documents=chunks, metadatas=metadatas, ids=ids)
-        save_document_chunks(document_id=document_id, chunks=chunks, chroma_ids=ids, base_metadata={"session_id": session_id})
-
-        summary_bundle = summarize_text(text, llm_generator=llm_generator)
-        save_document_summary(document_id, "short_summary", summary_bundle["short_summary"])
-        save_document_summary(document_id, "keywords", ", ".join(summary_bundle["keywords"]))
-        save_document_summary(
-            document_id,
-            "interview_takeaways",
-            "\n".join(summary_bundle["interview_takeaways"]),
-        )
-
-        knowledge_point_ids = save_knowledge_points(session_id, document_id, summary_bundle["knowledge_points"])
-        create_review_items_from_knowledge_points(
-            user_id=user_id,
-            session_id=session_id,
-            knowledge_points=summary_bundle["knowledge_points"],
-            knowledge_point_ids=knowledge_point_ids,
-        )
-
-        mark_document_ingested(document_id=document_id, status="completed")
-        created_documents.append(
-            {
-                "document_id": document_id,
-                "file_name": upload.filename,
-                "summary": summary_bundle["short_summary"],
-                "knowledge_points": summary_bundle["knowledge_points"],
-            }
-        )
-
-    all_summaries = get_session_summaries(session_id)
-    overall_summary = {
-        "short_summary": "\n".join(
-            [item["summary_text"] for item in all_summaries if item["summary_type"] == "short_summary"][:3]
-        ),
-        "keywords": [],
-    }
-    for item in all_summaries:
-        if item["summary_type"] == "keywords":
-            overall_summary["keywords"].extend([part.strip() for part in item["summary_text"].split(",") if part.strip()])
-
-    metadata = infer_session_metadata(
-        file_names=file_names,
-        merged_text="\n\n".join(merged_text_parts),
-        summary_bundle=overall_summary,
-        llm_generator=llm_generator,
-    )
-    updated_session = update_study_session(
-        session_id=session_id,
-        session_name=metadata["session_name"],
-        topic=metadata["topic"],
-        goal=metadata["goal"],
-        tags=metadata.get("tags", []),
-    )
-
+    updated_session = _refresh_session_metadata(session_id, file_names, merged_text_parts)
     return {"session": updated_session, "documents": created_documents}
+
+
+def _ingest_webpage_for_session(session_id: int, user_id: str, url: str):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    try:
+        webpage = fetch_webpage_content(url)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        raise HTTPException(status_code=status_code, detail=f"Failed to fetch webpage: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to import webpage: {exc}")
+
+    created_document, display_name, preview_text = _ingest_text_resource(
+        session_id=session_id,
+        user_id=user_id,
+        title=webpage["title"],
+        file_name=webpage["source_url"],
+        file_path=webpage["source_url"],
+        file_type="url",
+        file_size=len(webpage["text"].encode("utf-8")),
+        text=webpage["text"],
+        source_type="webpage",
+        metadata={
+            "source": webpage["source_url"],
+            "source_url": webpage["source_url"],
+            "site_name": webpage["site_name"],
+        },
+    )
+    updated_session = _refresh_session_metadata(session_id, [display_name], [preview_text])
+    return {"session": updated_session, "documents": [created_document], "webpage": webpage}
+
+
 def _build_session_retriever(session_id: int):
     where = {"session_id": str(session_id)}
     doc_chunks = vector_store.get_all_documents(where=where)
@@ -200,6 +297,27 @@ def _build_session_retriever(session_id: int):
         vector_where=where,
     )
     return retriever, doc_chunks
+
+
+def _delete_session_resources(session_id: int, user_id: str):
+    if not get_study_session(session_id):
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    try:
+        vector_store.delete_documents(where={"session_id": str(session_id)})
+    except Exception:
+        pass
+
+    session_dir = UPLOAD_DIR / f"session_{session_id}"
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+    deleted = delete_study_session(session_id=session_id, user_id=user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Study session not found for this user.")
+
+    delete_session_history(user_id=user_id, session_id=session_id)
+    return {"deleted": True, "session_id": session_id}
 
 
 def _format_sources(retrieved_results: list[dict]) -> list[dict]:
@@ -259,6 +377,11 @@ async def get_session_detail_endpoint(session_id: int):
     }
 
 
+@app.delete("/study_sessions/{session_id}")
+async def delete_session_endpoint(session_id: int, request: SessionDeleteRequest):
+    return _delete_session_resources(session_id=session_id, user_id=request.user_id)
+
+
 @app.post("/study_sessions/{session_id}/documents")
 async def upload_documents_endpoint(
     session_id: int,
@@ -285,6 +408,33 @@ async def auto_create_session_from_documents_endpoint(
         session_id=placeholder_session["id"],
         user_id=user_id,
         files=files,
+    )
+    return {
+        "session_id": placeholder_session["id"],
+        "session": result["session"],
+        "documents": result["documents"],
+    }
+
+
+@app.post("/study_sessions/{session_id}/webpages")
+async def import_webpage_endpoint(session_id: int, request: WebpageImportRequest):
+    result = _ingest_webpage_for_session(session_id=session_id, user_id=request.user_id, url=request.url)
+    return {"session_id": session_id, "session": result["session"], "documents": result["documents"]}
+
+
+@app.post("/study_sessions/auto_from_webpage")
+async def auto_create_session_from_webpage_endpoint(request: WebpageImportRequest):
+    placeholder_session = create_study_session(
+        user_id=request.user_id,
+        session_name="网页资料整理中",
+        topic="待分析",
+        goal="等待系统根据网页内容自动生成学习信息。",
+        tags=[],
+    )
+    result = _ingest_webpage_for_session(
+        session_id=placeholder_session["id"],
+        user_id=request.user_id,
+        url=request.url,
     )
     return {
         "session_id": placeholder_session["id"],

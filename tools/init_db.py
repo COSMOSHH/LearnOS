@@ -5,6 +5,13 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
 
 
+def _ensure_column(cursor, table_name: str, column_name: str, column_definition: str):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    if column_name not in existing_columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+
+
 def init_study_db() -> str:
     """Initialize the SQLite schema required for the study-agent MVP."""
 
@@ -120,6 +127,9 @@ def init_study_db() -> str:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_session_id ON knowledge_points(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_review_user_next_review ON review_items(user_id, next_review_at)")
+
+    _ensure_column(cursor, "study_documents", "source_type", "TEXT DEFAULT 'upload'")
+    _ensure_column(cursor, "study_documents", "metadata_json", "TEXT")
 
     conn.commit()
     conn.close()

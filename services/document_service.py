@@ -25,6 +25,7 @@ def create_document(
     file_type: str,
     file_size: int,
     content_hash: str,
+    source_type: str = "upload",
     metadata: dict | None = None,
 ):
     conn = _connect()
@@ -32,8 +33,8 @@ def create_document(
     cursor.execute(
         """
         INSERT INTO study_documents
-        (session_id, title, file_name, file_path, file_type, file_size, content_hash, ingest_status, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?)
+        (session_id, title, file_name, file_path, file_type, file_size, content_hash, ingest_status, source_type, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
         """,
         (
             session_id,
@@ -43,6 +44,7 @@ def create_document(
             file_type,
             file_size,
             content_hash,
+            source_type,
             json.dumps(metadata or {}, ensure_ascii=False),
         ),
     )

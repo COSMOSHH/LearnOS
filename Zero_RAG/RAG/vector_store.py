@@ -52,3 +52,12 @@ class ChromaDBStore:
             for document, metadata in zip(results["documents"], results["metadatas"]):
                 all_chunks.append({"chunk_text": document, "metadata": metadata if metadata else {}})
         return all_chunks
+
+    def delete_documents(self, where: dict | None = None, ids: list[str] | None = None):
+        kwargs = {}
+        if where:
+            kwargs["where"] = where
+        if ids:
+            kwargs["ids"] = ids
+        if kwargs:
+            self.collection.delete(**kwargs)

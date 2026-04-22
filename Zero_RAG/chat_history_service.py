@@ -142,3 +142,16 @@ def get_user_history(user_id: str, session_id: int | None = None):
             }
         )
     return history
+
+
+def delete_session_history(user_id: str, session_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM chat_history WHERE user_id = ? AND session_id = ?",
+        (user_id, session_id),
+    )
+    thread_id = f"thread_{user_id}_{session_id}"
+    cursor.execute("DELETE FROM thread_state WHERE thread_id = ?", (thread_id,))
+    conn.commit()
+    conn.close()
