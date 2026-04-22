@@ -41,8 +41,8 @@ def ensure_user_id() -> str:
     return new_user_id
 
 
-st.set_page_config(page_title="学习辅助 Agent", layout="wide")
-st.title("学习辅助 Agent 工作台")
+st.set_page_config(page_title="LearnOS", layout="wide")
+st.title("LearnOS 工作台")
 st.caption("上传资料后，系统会自动生成会话名称、学习主题和学习目标。")
 
 

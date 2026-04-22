@@ -1,4 +1,4 @@
-# 学习辅助 Agent
+# LearnOS
 
 一个面向个人学习、文档问答、自动复习和面试准备的多 Agent 学习系统。
 
@@ -31,7 +31,7 @@
 ## 项目结构
 
 ```text
-Muti_Agent/
+LearnOS/
 ├─ Zero_RAG/
 │  ├─ Server.py                  # FastAPI 后端入口
 │  ├─ Client.py                  # Streamlit 中文前端
@@ -219,8 +219,8 @@ Zero_RAG/chroma_db
 
 ## 相关文档
 
-1. [学习辅助Agent项目改造计划.md](e:\files\vscode_file\agent\Muti_Agent\学习辅助Agent项目改造计划.md)
-2. [产品功能清单与优先级.md](e:\files\vscode_file\agent\Muti_Agent\产品功能清单与优先级.md)
-3. [数据库表结构设计.md](e:\files\vscode_file\agent\Muti_Agent\数据库表结构设计.md)
-4. [多Agent架构图.md](e:\files\vscode_file\agent\Muti_Agent\多Agent架构图.md)
-5. [第一阶段实施任务拆解.md](e:\files\vscode_file\agent\Muti_Agent\第一阶段实施任务拆解.md)
+1. [学习辅助Agent项目改造计划.md](学习辅助Agent项目改造计划.md)
+2. [产品功能清单与优先级.md](产品功能清单与优先级.md)
+3. [数据库表结构设计.md](数据库表结构设计.md)
+4. [多Agent架构图.md](多Agent架构图.md)
+5. [第一阶段实施任务拆解.md](第一阶段实施任务拆解.md)

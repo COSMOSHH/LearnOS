@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Study Agent API", lifespan=lifespan)
+app = FastAPI(title="LearnOS API", lifespan=lifespan)
 vector_store = ChromaDBStore()
 llm_generator = LLMGenerator(
     model_name=config.chat_model,
