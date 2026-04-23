@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
+OBJECTIVE_TYPES = {"single_choice", "multiple_choice", "fill_blank"}
 
 
 def _connect():
@@ -29,36 +30,119 @@ def _tokenize(text: str) -> list[str]:
     return [token.lower() for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_]+", text or "")]
 
 
+def _parse_question_metadata(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _normalize_answer_payload(answer):
+    if isinstance(answer, list):
+        return [str(item).strip() for item in answer if str(item).strip()]
+    if answer is None:
+        return ""
+    return str(answer).strip()
+
+
+def _stringify_answer(answer) -> str:
+    normalized = _normalize_answer_payload(answer)
+    if isinstance(normalized, list):
+        return ", ".join(normalized)
+    return normalized
+
+
 def _normalize_questions(questions: list[dict], fallback_source: list[dict], question_count: int) -> list[dict]:
     normalized = []
     for index, item in enumerate(questions[:question_count], start=1):
+        question_type = str(item.get("question_type", "short_answer") or "short_answer").strip().lower()
+        if question_type not in {"short_answer", "single_choice", "multiple_choice", "fill_blank"}:
+            question_type = "short_answer"
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if not metadata:
+            metadata = {
+                "options": item.get("options", []),
+                "correct_answer": item.get("correct_answer"),
+                "correct_answers": item.get("correct_answers", []),
+                "blank_answers": item.get("blank_answers", []),
+            }
         normalized.append(
             {
                 "question_index": index,
-                "question_type": item.get("question_type", "short_answer"),
+                "question_type": question_type,
                 "question_text": item.get("question_text") or item.get("question") or f"请解释第 {index} 个核心知识点。",
                 "reference_answer": item.get("reference_answer", ""),
                 "scoring_rubric": item.get("scoring_rubric", "回答应包含定义、原理、影响与例子。"),
+                "metadata": metadata,
             }
         )
 
     while len(normalized) < question_count:
         source = fallback_source[len(normalized) % len(fallback_source)] if fallback_source else {}
-        index = len(normalized) + 1
-        normalized.append(
-            {
-                "question_index": index,
-                "question_type": "short_answer",
-                "question_text": source.get("question_text") or f"请总结本次学习中第 {index} 个最关键的知识点。",
-                "reference_answer": source.get("reference_answer", ""),
-                "scoring_rubric": source.get("scoring_rubric", "回答应包含核心概念、作用和适用场景。"),
-            }
-        )
+        source = dict(source)
+        source["question_index"] = len(normalized) + 1
+        normalized.append(source)
     return normalized
 
 
+def _build_choice_question(point: dict, knowledge_points: list[dict], index: int) -> dict:
+    titles = []
+    for item in knowledge_points:
+        title = item.get("title", "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    correct_title = point.get("title", "核心知识点")
+    if correct_title not in titles:
+        titles.insert(0, correct_title)
+    options = titles[:4]
+    while len(options) < 4:
+        options.append(f"干扰项{len(options) + 1}")
+    return {
+        "question_index": index,
+        "question_type": "single_choice",
+        "question_text": f"单选题：下面哪个概念最符合这段描述？{point.get('description', '')}",
+        "reference_answer": correct_title,
+        "scoring_rubric": "选出与描述最匹配的概念即可。",
+        "metadata": {
+            "options": options,
+            "correct_answer": correct_title,
+        },
+    }
+
+
+def _build_fill_blank_question(point: dict, index: int) -> dict:
+    title = point.get("title", "核心知识点")
+    description = point.get("description", "")
+    hint = description[:36] if description else f"{title} 的核心作用"
+    return {
+        "question_index": index,
+        "question_type": "fill_blank",
+        "question_text": f"填空题：请写出最匹配这段提示的知识点名称。提示：{hint}",
+        "reference_answer": title,
+        "scoring_rubric": "填出准确知识点名称即可。",
+        "metadata": {
+            "blank_answers": [title],
+        },
+    }
+
+
+def _build_short_answer_question(point: dict, index: int) -> dict:
+    return {
+        "question_index": index,
+        "question_type": "short_answer",
+        "question_text": f"请解释“{point.get('title', '核心知识点')}”，并说明它为什么重要。",
+        "reference_answer": point.get("description", ""),
+        "scoring_rubric": "回答应包含定义、原理、作用和一个具体例子。",
+        "metadata": {},
+    }
+
+
 def _fallback_generate_quiz(session_name: str, knowledge_points: list[dict], question_count: int, difficulty: str) -> dict:
-    base_points = knowledge_points[:question_count]
+    base_points = knowledge_points[: max(1, question_count)]
     if not base_points:
         base_points = [
             {
@@ -70,20 +154,18 @@ def _fallback_generate_quiz(session_name: str, knowledge_points: list[dict], que
     questions = []
     for index in range(question_count):
         point = base_points[index % len(base_points)]
-        questions.append(
-            {
-                "question_index": index + 1,
-                "question_type": "short_answer",
-                "question_text": f"请解释“{point.get('title', '核心知识点')}”，并说明它为什么重要。",
-                "reference_answer": point.get("description", ""),
-                "scoring_rubric": "回答应包含定义、原理、作用和一个具体例子。",
-            }
-        )
+        question_index = index + 1
+        if question_index == 1:
+            questions.append(_build_choice_question(point, knowledge_points, question_index))
+        elif question_index == 2:
+            questions.append(_build_fill_blank_question(point, question_index))
+        else:
+            questions.append(_build_short_answer_question(point, question_index))
 
     return {
         "title": f"{session_name} 自测题",
         "difficulty": difficulty,
-        "instructions": "请尽量用自己的语言回答，回答后可根据反馈继续补充理解。",
+        "instructions": "先完成选择题和填空题，再用自己的语言完成简答题。",
         "questions": questions,
     }
 
@@ -111,7 +193,7 @@ def generate_quiz_bundle(
 要求：
 1. 输出必须是合法 JSON。
 2. 题目数量为 {question_count} 道。
-3. 题型以简答题为主，适合学习后自测。
+3. 至少包含一道单选题和一道填空题，其余可以是简答题。
 4. 所有内容必须是中文。
 5. 每道题都提供参考答案和评分要点。
 
@@ -121,6 +203,21 @@ JSON 结构：
   "difficulty": "{difficulty}",
   "instructions": "作答说明",
   "questions": [
+    {{
+      "question_type": "single_choice",
+      "question_text": "题目内容",
+      "options": ["选项A", "选项B", "选项C", "选项D"],
+      "correct_answer": "正确选项文本",
+      "reference_answer": "参考答案",
+      "scoring_rubric": "评分要点"
+    }},
+    {{
+      "question_type": "fill_blank",
+      "question_text": "填空题内容",
+      "blank_answers": ["答案1"],
+      "reference_answer": "参考答案",
+      "scoring_rubric": "评分要点"
+    }},
     {{
       "question_type": "short_answer",
       "question_text": "题目内容",
@@ -150,7 +247,7 @@ JSON 结构：
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=1400,
+            max_tokens=1600,
         )
         parsed = _extract_json_object(raw)
         if not parsed:
@@ -219,13 +316,18 @@ def get_quiz_set_with_questions(quiz_set_id: int) -> dict | None:
 
     cursor.execute(
         """
-        SELECT * FROM quiz_questions
+        SELECT *
+        FROM quiz_questions
         WHERE quiz_set_id = ?
         ORDER BY question_index ASC, id ASC
         """,
         (quiz_set_id,),
     )
-    questions = [dict(row) for row in cursor.fetchall()]
+    questions = []
+    for row in cursor.fetchall():
+        item = dict(row)
+        item["metadata"] = _parse_question_metadata(item.get("metadata_json"))
+        questions.append(item)
     conn.close()
     return {
         "quiz_set": dict(quiz_set),
@@ -256,7 +358,7 @@ def save_quiz_attempt(
     quiz_set_id: int,
     session_id: int,
     user_id: str,
-    answers: list[str],
+    answers: list,
     result: dict,
 ) -> int:
     conn = _connect()
@@ -288,7 +390,8 @@ def get_latest_quiz_attempt_for_session(session_id: int, user_id: str) -> dict |
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT * FROM quiz_attempts
+        SELECT *
+        FROM quiz_attempts
         WHERE session_id = ? AND user_id = ?
         ORDER BY created_at DESC, id DESC
         LIMIT 1
@@ -305,57 +408,95 @@ def get_latest_quiz_attempt_for_session(session_id: int, user_id: str) -> dict |
     return result
 
 
-def _fallback_grade_quiz(questions: list[dict], answers: list[str]) -> dict:
-    item_feedback = []
-    total_score = 0.0
-    for question, answer in zip(questions, answers):
-        reference = question.get("reference_answer", "")
-        overlap = len(set(_tokenize(reference)) & set(_tokenize(answer)))
-        answer_length = len((answer or "").strip())
-        base_score = 1.5 if answer_length > 20 else 0.5 if answer_length > 0 else 0.0
-        overlap_score = min(2.5, overlap * 0.5)
-        score = round(min(5.0, base_score + overlap_score), 1)
-        total_score += score
-        item_feedback.append(
-            {
-                "question_index": question.get("question_index"),
-                "score": score,
-                "max_score": 5,
-                "feedback": "回答覆盖了部分关键点。" if score >= 2.5 else "回答偏简略，建议补充定义、原理和例子。",
-                "suggestion": question.get("scoring_rubric", "补充核心概念、适用场景和例子。"),
-            }
-        )
-
-    average_score = round(total_score / max(1, len(questions)), 2)
+def _grade_single_choice(question: dict, answer) -> dict:
+    metadata = question.get("metadata") or {}
+    expected = str(metadata.get("correct_answer", "")).strip()
+    received = _stringify_answer(answer).strip()
+    is_correct = expected and received == expected
     return {
-        "total_score": round(total_score, 1),
-        "average_score": average_score,
-        "max_total_score": len(questions) * 5,
-        "overall_feedback": "整体掌握不错，可以继续通过追问和复习巩固细节。" if average_score >= 3 else "还有不少细节没有答完整，建议先回看摘要和知识点。",
-        "item_feedback": item_feedback,
+        "question_index": question.get("question_index"),
+        "score": 5.0 if is_correct else 1.0 if received else 0.0,
+        "max_score": 5.0,
+        "feedback": "回答正确。" if is_correct else "选择不正确。" if received else "未作答。",
+        "suggestion": f"正确答案是：{expected}" if expected and not is_correct else "",
     }
 
 
-def grade_quiz_attempt(questions: list[dict], answers: list[str], llm_generator=None) -> dict:
-    normalized_answers = [(item or "").strip() for item in answers]
-    fallback = _fallback_grade_quiz(questions, normalized_answers)
-    if llm_generator is None:
-        return fallback
+def _grade_multiple_choice(question: dict, answer) -> dict:
+    metadata = question.get("metadata") or {}
+    expected = {str(item).strip() for item in metadata.get("correct_answers", []) if str(item).strip()}
+    received = set(_normalize_answer_payload(answer)) if isinstance(_normalize_answer_payload(answer), list) else {str(_normalize_answer_payload(answer)).strip()} if _normalize_answer_payload(answer) else set()
+    if not expected:
+        return _grade_single_choice(question, answer)
+    overlap = len(expected & received)
+    penalty = len(received - expected)
+    raw_score = max(0.0, overlap - penalty * 0.5)
+    score = round(min(5.0, 5.0 * raw_score / max(1, len(expected))), 1)
+    is_correct = received == expected
+    return {
+        "question_index": question.get("question_index"),
+        "score": 5.0 if is_correct else score,
+        "max_score": 5.0,
+        "feedback": "回答正确。" if is_correct else "部分正确，仍有遗漏或误选。" if received else "未作答。",
+        "suggestion": f"正确答案是：{', '.join(expected)}" if expected and not is_correct else "",
+    }
 
-    question_blocks = []
-    for question, answer in zip(questions, normalized_answers):
-        question_blocks.append(
-            {
-                "question_index": question.get("question_index"),
-                "question_text": question.get("question_text", ""),
-                "reference_answer": question.get("reference_answer", ""),
-                "scoring_rubric": question.get("scoring_rubric", ""),
-                "learner_answer": answer,
-            }
-        )
 
+def _grade_fill_blank(question: dict, answer) -> dict:
+    metadata = question.get("metadata") or {}
+    expected_answers = [str(item).strip().lower() for item in metadata.get("blank_answers", []) if str(item).strip()]
+    received = _stringify_answer(answer).strip().lower()
+    if not received:
+        return {
+            "question_index": question.get("question_index"),
+            "score": 0.0,
+            "max_score": 5.0,
+            "feedback": "未作答。",
+            "suggestion": f"参考答案：{question.get('reference_answer', '')}",
+        }
+
+    matched = any(expected in received or received in expected for expected in expected_answers) if expected_answers else False
+    score = 5.0 if matched else 2.5 if expected_answers and set(_tokenize(received)) & set(_tokenize(" ".join(expected_answers))) else 1.0
+    return {
+        "question_index": question.get("question_index"),
+        "score": score,
+        "max_score": 5.0,
+        "feedback": "填空正确。" if score >= 5 else "答案部分接近，但不够准确。" if score >= 2.5 else "填空不正确。",
+        "suggestion": f"参考答案：{question.get('reference_answer', '')}" if score < 5 else "",
+    }
+
+
+def _fallback_grade_short_answer(question: dict, answer) -> dict:
+    reference = question.get("reference_answer", "")
+    answer_text = _stringify_answer(answer)
+    overlap = len(set(_tokenize(reference)) & set(_tokenize(answer_text)))
+    answer_length = len(answer_text.strip())
+    base_score = 1.5 if answer_length > 20 else 0.5 if answer_length > 0 else 0.0
+    overlap_score = min(2.5, overlap * 0.5)
+    score = round(min(5.0, base_score + overlap_score), 1)
+    return {
+        "question_index": question.get("question_index"),
+        "score": score,
+        "max_score": 5.0,
+        "feedback": "回答覆盖了部分关键点。" if score >= 2.5 else "回答偏简略，建议补充定义、原理和例子。",
+        "suggestion": question.get("scoring_rubric", "补充核心概念、适用场景和例子。"),
+    }
+
+
+def grade_single_question(question: dict, answer, llm_generator=None) -> dict:
+    question_type = str(question.get("question_type", "short_answer") or "short_answer").lower()
+    if question_type == "single_choice":
+        return _grade_single_choice(question, answer)
+    if question_type == "multiple_choice":
+        return _grade_multiple_choice(question, answer)
+    if question_type == "fill_blank":
+        return _grade_fill_blank(question, answer)
+    return _fallback_grade_short_answer(question, answer)
+
+
+def _grade_short_answers_with_llm(short_blocks: list[dict], llm_generator) -> dict[int, dict] | None:
     prompt = f"""
-请作为中文学习测验评分助手，对下面的自测题回答进行评分。
+请作为中文学习测验评分助手，对下面的简答题回答进行评分。
 
 要求：
 1. 输出必须是合法 JSON。
@@ -364,7 +505,6 @@ def grade_quiz_attempt(questions: list[dict], answers: list[str], llm_generator=
 
 JSON 结构：
 {{
-  "overall_feedback": "总体反馈",
   "item_feedback": [
     {{
       "question_index": 1,
@@ -377,49 +517,82 @@ JSON 结构：
 }}
 
 题目与回答：
-{json.dumps(question_blocks, ensure_ascii=False)}
+{json.dumps(short_blocks, ensure_ascii=False)}
 """
+    raw = llm_generator.chat_once(
+        messages=[
+            {
+                "role": "system",
+                "content": "你是一个中文学习测验评分助手，擅长根据参考答案和评分标准给出简洁可靠的评分结果。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+        max_tokens=1400,
+    )
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return None
+    feedback_map = {}
+    for item in parsed.get("item_feedback", []):
+        question_index = int(item.get("question_index", 0) or 0)
+        if question_index <= 0:
+            continue
+        feedback_map[question_index] = {
+            "question_index": question_index,
+            "score": float(item.get("score", 0) or 0),
+            "max_score": float(item.get("max_score", 5) or 5),
+            "feedback": item.get("feedback", ""),
+            "suggestion": item.get("suggestion", ""),
+        }
+    return feedback_map or None
 
-    try:
-        raw = llm_generator.chat_once(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个中文学习测验评分助手，擅长根据参考答案和评分标准给出简洁可靠的评分结果。",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=1400,
-        )
-        parsed = _extract_json_object(raw)
-        if not parsed:
-            return fallback
 
-        item_feedback = []
-        total_score = 0.0
-        for index, item in enumerate(parsed.get("item_feedback", [])[: len(questions)], start=1):
-            score = float(item.get("score", 0))
-            total_score += score
-            item_feedback.append(
+def grade_quiz_attempt(questions: list[dict], answers: list, llm_generator=None) -> dict:
+    normalized_answers = [_normalize_answer_payload(item) for item in answers]
+    item_feedback = []
+    short_blocks = []
+    for question, answer in zip(questions, normalized_answers):
+        metadata = question.get("metadata")
+        if metadata is None:
+            question["metadata"] = _parse_question_metadata(question.get("metadata_json"))
+        question_type = str(question.get("question_type", "short_answer") or "short_answer").lower()
+        if question_type in OBJECTIVE_TYPES:
+            item_feedback.append(grade_single_question(question, answer, llm_generator=None))
+        else:
+            short_blocks.append(
                 {
-                    "question_index": item.get("question_index", index),
-                    "score": score,
-                    "max_score": float(item.get("max_score", 5)),
-                    "feedback": item.get("feedback", ""),
-                    "suggestion": item.get("suggestion", ""),
+                    "question_index": question.get("question_index"),
+                    "question_text": question.get("question_text", ""),
+                    "reference_answer": question.get("reference_answer", ""),
+                    "scoring_rubric": question.get("scoring_rubric", ""),
+                    "learner_answer": _stringify_answer(answer),
                 }
             )
 
-        if not item_feedback:
-            return fallback
+    llm_short_feedback = None
+    if llm_generator is not None and short_blocks:
+        try:
+            llm_short_feedback = _grade_short_answers_with_llm(short_blocks, llm_generator)
+        except Exception:
+            llm_short_feedback = None
 
-        return {
-            "total_score": round(total_score, 1),
-            "average_score": round(total_score / max(1, len(item_feedback)), 2),
-            "max_total_score": len(questions) * 5,
-            "overall_feedback": parsed.get("overall_feedback", fallback["overall_feedback"]),
-            "item_feedback": item_feedback,
-        }
-    except Exception:
-        return fallback
+    for question, answer in zip(questions, normalized_answers):
+        question_type = str(question.get("question_type", "short_answer") or "short_answer").lower()
+        if question_type in OBJECTIVE_TYPES:
+            continue
+        feedback = None
+        if llm_short_feedback is not None:
+            feedback = llm_short_feedback.get(int(question.get("question_index", 0) or 0))
+        item_feedback.append(feedback or _fallback_grade_short_answer(question, answer))
+
+    item_feedback.sort(key=lambda item: int(item.get("question_index", 0) or 0))
+    total_score = round(sum(float(item.get("score", 0) or 0) for item in item_feedback), 1)
+    average_score = round(total_score / max(1, len(questions)), 2)
+    return {
+        "total_score": total_score,
+        "average_score": average_score,
+        "max_total_score": len(questions) * 5,
+        "overall_feedback": "整体掌握不错，可以继续通过追问和复习巩固细节。" if average_score >= 3 else "还有不少细节没有答完整，建议先回看摘要和知识点。",
+        "item_feedback": item_feedback,
+    }

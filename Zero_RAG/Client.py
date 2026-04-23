@@ -61,12 +61,16 @@ def reset_cached_views():
     st.session_state["quiz_session_id"] = None
     st.session_state["quiz_attempt"] = None
     st.session_state["quiz_attempt_session_id"] = None
+    st.session_state["review_queue"] = None
+    st.session_state["review_queue_session_id"] = None
     st.session_state["wrong_questions"] = None
     st.session_state["wrong_questions_filters"] = None
     st.session_state["plan_data"] = None
     st.session_state["plan_session_id"] = None
     st.session_state["report_data"] = None
     st.session_state["report_session_id"] = None
+    st.session_state["event_logs"] = None
+    st.session_state["event_logs_session_id"] = None
 
 
 def refresh_sessions():
@@ -357,6 +361,18 @@ def submit_quiz_answers(quiz_set_id: int, answers: list[str]):
         st.session_state["quiz_attempt"] = payload
         st.session_state["quiz_attempt_session_id"] = st.session_state["selected_session_id"]
         load_session_detail(st.session_state["selected_session_id"])
+        load_learning_plan(only_incomplete=st.session_state.get("plan_only_incomplete", False))
+        fetch_review_queue(
+            limit=st.session_state.get("review_queue_limit", 8),
+            due_only=st.session_state.get("review_queue_due_only", True),
+        )
+        filters = st.session_state.get("wrong_questions_filters") or {}
+        if filters:
+            fetch_wrong_questions(
+                session_id=filters.get("session_id"),
+                max_score=filters.get("max_score"),
+                recent_days=filters.get("recent_days"),
+            )
         created_count = int(payload.get("review_items_created", 0) or 0)
         if created_count > 0:
             st.success(f"测验已提交，评分结果如下。系统已新增 {created_count} 条高优先级复习项。")
@@ -419,6 +435,54 @@ def update_plan_item(item_id: int, is_completed: bool):
         st.error(extract_error_message(response))
 
 
+def reprioritize_learning_plan():
+    payload = {"user_id": st.session_state["user_id"]}
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/plan/reprioritize",
+        json=payload,
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["plan_data"] = response.json()["plan"]
+        st.session_state["plan_session_id"] = st.session_state["selected_session_id"]
+        st.success("学习计划已按当前进展重排优先级。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def fetch_review_queue(limit: int = 8, due_only: bool = True):
+    params = {
+        "user_id": st.session_state["user_id"],
+        "limit": limit,
+        "due_only": str(bool(due_only)).lower(),
+    }
+    if st.session_state.get("selected_session_id") is not None:
+        params["session_id"] = st.session_state["selected_session_id"]
+    response = requests.get(f"{API_BASE_URL}/review_queue", params=params, timeout=30)
+    if response.ok:
+        st.session_state["review_queue"] = response.json()["items"]
+        st.session_state["review_queue_session_id"] = st.session_state.get("selected_session_id")
+    else:
+        st.error(extract_error_message(response))
+
+
+def update_review_progress_action(item_id: int, outcome: str, notes: str = ""):
+    response = requests.patch(
+        f"{API_BASE_URL}/review_items/{item_id}/progress",
+        json={"outcome": outcome, "notes": notes},
+        timeout=30,
+    )
+    if response.ok:
+        fetch_review_queue(
+            limit=st.session_state.get("review_queue_limit", 8),
+            due_only=st.session_state.get("review_queue_due_only", True),
+        )
+        load_learning_plan(only_incomplete=st.session_state.get("plan_only_incomplete", False))
+        load_session_detail(st.session_state["selected_session_id"])
+    else:
+        st.error(extract_error_message(response))
+
+
 def fetch_wrong_questions(session_id: int | None, max_score: float | None, recent_days: int | None):
     params = {"user_id": st.session_state["user_id"]}
     if session_id is not None:
@@ -435,6 +499,44 @@ def fetch_wrong_questions(session_id: int | None, max_score: float | None, recen
             "max_score": max_score,
             "recent_days": recent_days,
         }
+    else:
+        st.error(extract_error_message(response))
+
+
+def retry_wrong_question_action(item_id: int, answer):
+    response = requests.post(
+        f"{API_BASE_URL}/wrong_questions/{item_id}/retry",
+        json={"user_id": st.session_state["user_id"], "answer": answer},
+        timeout=60,
+    )
+    if response.ok:
+        filters = st.session_state.get("wrong_questions_filters") or {}
+        fetch_wrong_questions(
+            session_id=filters.get("session_id"),
+            max_score=filters.get("max_score"),
+            recent_days=filters.get("recent_days"),
+        )
+        fetch_review_queue(
+            limit=st.session_state.get("review_queue_limit", 8),
+            due_only=st.session_state.get("review_queue_due_only", True),
+        )
+        load_learning_plan(only_incomplete=st.session_state.get("plan_only_incomplete", False))
+        load_session_detail(st.session_state["selected_session_id"])
+        st.success("错题已重新评分，状态已更新。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def load_recent_events(limit: int = 20, status: str | None = None):
+    params = {"limit": limit}
+    if st.session_state.get("selected_session_id") is not None:
+        params["session_id"] = st.session_state["selected_session_id"]
+    if status:
+        params["status"] = status
+    response = requests.get(f"{API_BASE_URL}/system/events", params=params, timeout=30)
+    if response.ok:
+        st.session_state["event_logs"] = response.json()["events"]
+        st.session_state["event_logs_session_id"] = st.session_state.get("selected_session_id")
     else:
         st.error(extract_error_message(response))
 
@@ -484,6 +586,54 @@ def get_current_plan():
 
 def get_current_wrong_questions():
     return st.session_state.get("wrong_questions") or []
+
+
+def get_current_review_queue():
+    if st.session_state.get("review_queue_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("review_queue") or []
+    return []
+
+
+def get_current_event_logs():
+    if st.session_state.get("event_logs_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("event_logs") or []
+    return []
+
+
+def render_quiz_answer_input(question: dict, quiz_set_id: int, index: int):
+    question_type = question.get("question_type", "short_answer")
+    base_key = f"quiz_answer_{quiz_set_id}_{index}"
+    options = (question.get("metadata") or {}).get("options", [])
+    if question_type == "single_choice":
+        return st.radio(
+            f"single_choice_{quiz_set_id}_{index}",
+            options=options,
+            key=base_key,
+            index=None,
+            horizontal=False,
+            label_visibility="collapsed",
+        )
+    if question_type == "multiple_choice":
+        return st.multiselect(
+            f"multiple_choice_{quiz_set_id}_{index}",
+            options=options,
+            key=base_key,
+            label_visibility="collapsed",
+        )
+    if question_type == "fill_blank":
+        return st.text_input(
+            f"fill_blank_{quiz_set_id}_{index}",
+            key=base_key,
+            label_visibility="collapsed",
+            placeholder="在这里填写答案...",
+        )
+    return st.text_area(
+        f"short_answer_{quiz_set_id}_{index}",
+        key=base_key,
+        label_visibility="collapsed",
+        placeholder="在这里写下你的回答...",
+        height=120,
+    )
 
 
 st.set_page_config(page_title="LearnOS", layout="wide")
@@ -536,6 +686,10 @@ if "quiz_attempt" not in st.session_state:
     st.session_state["quiz_attempt"] = None
 if "quiz_attempt_session_id" not in st.session_state:
     st.session_state["quiz_attempt_session_id"] = None
+if "review_queue" not in st.session_state:
+    st.session_state["review_queue"] = None
+if "review_queue_session_id" not in st.session_state:
+    st.session_state["review_queue_session_id"] = None
 if "report_data" not in st.session_state:
     st.session_state["report_data"] = None
 if "report_session_id" not in st.session_state:
@@ -548,8 +702,16 @@ if "wrong_questions" not in st.session_state:
     st.session_state["wrong_questions"] = None
 if "wrong_questions_filters" not in st.session_state:
     st.session_state["wrong_questions_filters"] = None
+if "event_logs" not in st.session_state:
+    st.session_state["event_logs"] = None
+if "event_logs_session_id" not in st.session_state:
+    st.session_state["event_logs_session_id"] = None
 if "plan_only_incomplete" not in st.session_state:
     st.session_state["plan_only_incomplete"] = False
+if "review_queue_limit" not in st.session_state:
+    st.session_state["review_queue_limit"] = 8
+if "review_queue_due_only" not in st.session_state:
+    st.session_state["review_queue_due_only"] = True
 if "new_session_name_input" not in st.session_state:
     st.session_state["new_session_name_input"] = ""
 
@@ -701,7 +863,9 @@ with st.expander("会话概览", expanded=False):
         st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-chat_tab, quiz_tab, wrong_tab, plan_tab, report_tab = st.tabs(["学习问答", "测验模式", "错题本", "学习计划", "学习报告"])
+chat_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, logs_tab = st.tabs(
+    ["学习问答", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "运行日志"]
+)
 
 with chat_tab:
     st.subheader("学习问答")
@@ -767,16 +931,19 @@ with quiz_tab:
             answers = []
             for index, question in enumerate(quiz_bundle.get("questions", []), start=1):
                 st.markdown(f"**第 {index} 题**")
-                st.write(question.get("question_text", ""))
-                answers.append(
-                    st.text_area(
-                        f"answer_{quiz_bundle['quiz_set_id']}_{index}",
-                        key=f"quiz_answer_{quiz_bundle['quiz_set_id']}_{index}",
-                        label_visibility="collapsed",
-                        placeholder="在这里写下你的回答...",
-                        height=120,
-                    )
+                st.caption(
+                    {
+                        "single_choice": "题型：单选题",
+                        "multiple_choice": "题型：多选题",
+                        "fill_blank": "题型：填空题",
+                    }.get(question.get("question_type", "short_answer"), "题型：简答题")
                 )
+                st.write(question.get("question_text", ""))
+                metadata = question.get("metadata") or {}
+                if metadata.get("options"):
+                    for option_index, option in enumerate(metadata.get("options", []), start=1):
+                        st.caption(f"{chr(64 + option_index)}. {option}")
+                answers.append(render_quiz_answer_input(question, quiz_bundle["quiz_set_id"], index))
 
             if st.button("提交测验并评分", key=f"submit_quiz_{quiz_bundle['quiz_set_id']}", use_container_width=True):
                 submit_quiz_answers(quiz_bundle["quiz_set_id"], answers)
@@ -829,25 +996,122 @@ with wrong_tab:
         for item in wrong_questions:
             session_text = item.get("session_name") or f"会话 #{item.get('session_id')}"
             score_text = f"{item.get('score', 0)} / {item.get('max_score', 5)}"
+            status_text = item.get("review_status", "new")
             title = item.get("question_text") or item.get("topic") or "未命名错题"
-            with st.expander(f"{title} | {score_text} | {session_text}", expanded=False):
+            with st.expander(f"{title} | {score_text} | {status_text} | {session_text}", expanded=False):
                 st.markdown(f"**题目**：{item.get('question_text') or item.get('topic')}")
-                st.caption(f"记录时间：{item.get('created_at', '')}")
+                st.caption(
+                    f"记录时间：{item.get('created_at', '')} | "
+                    f"重练次数：{item.get('retry_count', 0)} | "
+                    f"最佳分数：{item.get('best_score', 0)} | "
+                    f"当前优先级：{item.get('queue_score', item.get('priority_score', 0))}"
+                )
                 st.markdown(f"**评分反馈**：{item.get('feedback', item.get('summary', ''))}")
                 if item.get("suggestion"):
                     st.markdown(f"**改进建议**：{item['suggestion']}")
                 if item.get("reference_answer"):
                     st.markdown("**参考答案要点**")
                     st.write(item["reference_answer"])
+                options = item.get("question_options") or []
+                question_type = item.get("question_type", "short_answer")
+                retry_key = f"wrong_retry_{item['id']}"
+                if question_type == "single_choice":
+                    retry_answer = st.radio(
+                        "重新作答",
+                        options=options,
+                        key=retry_key,
+                        index=None,
+                        label_visibility="collapsed",
+                    )
+                elif question_type == "multiple_choice":
+                    retry_answer = st.multiselect(
+                        "重新作答",
+                        options=options,
+                        key=retry_key,
+                        label_visibility="collapsed",
+                    )
+                elif question_type == "fill_blank":
+                    retry_answer = st.text_input(
+                        "重新作答",
+                        key=retry_key,
+                        label_visibility="collapsed",
+                        placeholder="重新填写答案...",
+                    )
+                else:
+                    retry_answer = st.text_area(
+                        "重新作答",
+                        key=retry_key,
+                        label_visibility="collapsed",
+                        placeholder="重新组织并写下你的回答...",
+                        height=100,
+                    )
+                if st.button("重新练习并评分", key=f"retry_submit_{item['id']}", use_container_width=True):
+                    retry_wrong_question_action(item["id"], retry_answer)
+                    st.rerun()
+                if item.get("retry_history"):
+                    st.markdown("**最近状态演进**")
+                    for history in item.get("retry_history", []):
+                        st.caption(
+                            f"{history.get('created_at') or history.get('retried_at', '')} | "
+                            f"状态={history.get('status', '')} | "
+                            f"得分={history.get('total_score', history.get('score', 0))}"
+                        )
     else:
         st.caption("点击上方按钮，按会话、分数和时间筛选当前错题。")
+
+with review_tab:
+    st.subheader("复习调度")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再开始复习调度。")
+    else:
+        review_col1, review_col2 = st.columns([1, 1])
+        with review_col1:
+            st.session_state["review_queue_limit"] = st.slider(
+                "队列数量",
+                min_value=3,
+                max_value=12,
+                value=st.session_state.get("review_queue_limit", 8),
+            )
+        with review_col2:
+            st.session_state["review_queue_due_only"] = st.checkbox(
+                "只看到期或即将到期",
+                value=st.session_state.get("review_queue_due_only", True),
+            )
+        if st.button("刷新复习队列", use_container_width=True):
+            fetch_review_queue(
+                limit=st.session_state["review_queue_limit"],
+                due_only=st.session_state["review_queue_due_only"],
+            )
+
+        review_queue = get_current_review_queue()
+        if review_queue:
+            st.caption(f"当前共拉取 {len(review_queue)} 条复习项，已按调度优先级排序。")
+            for item in review_queue:
+                with st.container(border=True):
+                    st.markdown(f"**{item.get('topic', '未命名复习项')}**")
+                    st.caption(
+                        f"队列分数：{item.get('queue_score', 0)} | "
+                        f"状态：{item.get('review_status', 'new')} | "
+                        f"到期状态：{item.get('due_state', 'unknown')} | "
+                        f"掌握度：{item.get('mastery_level', 0)}"
+                    )
+                    st.write(item.get("summary", ""))
+                    action_cols = st.columns(4)
+                    action_specs = [("Again", "again"), ("Hard", "hard"), ("Good", "good"), ("Easy", "easy")]
+                    for action_col, (label, outcome) in zip(action_cols, action_specs):
+                        with action_col:
+                            if st.button(label, key=f"review_{item['id']}_{outcome}", use_container_width=True):
+                                update_review_progress_action(item["id"], outcome)
+                                st.rerun()
+        else:
+            st.caption("点击上方按钮刷新复习队列，系统会按复习优先级自动排序。")
 
 with plan_tab:
     st.subheader("学习计划")
     if st.session_state["selected_session_id"] is None:
         st.info("先新建会话或导入资料后再生成学习计划。")
     else:
-        plan_action_col1, plan_action_col2 = st.columns([1, 1])
+        plan_action_col1, plan_action_col2, plan_action_col3 = st.columns([1, 1, 1])
         with plan_action_col1:
             if st.button("生成 / 刷新学习计划", use_container_width=True):
                 generate_learning_plan()
@@ -855,11 +1119,22 @@ with plan_tab:
             only_incomplete = st.checkbox("今天只看未完成项", key="plan_only_incomplete")
             if st.button("加载已保存学习计划", use_container_width=True):
                 load_learning_plan(only_incomplete=only_incomplete)
+        with plan_action_col3:
+            if st.button("按当前进展重排优先级", use_container_width=True):
+                reprioritize_learning_plan()
 
         plan = get_current_plan()
         if plan:
             st.markdown(f"**{plan.get('title', '学习计划')}**")
             st.write(plan.get("overview", ""))
+            progress = plan.get("progress", {})
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
+                st.metric("计划项总数", progress.get("total_items", 0))
+            with metric_col2:
+                st.metric("已完成", progress.get("completed_items", 0))
+            with metric_col3:
+                st.metric("完成率", f"{progress.get('completion_rate', 0)}%")
 
             plan_col1, plan_col2 = st.columns(2)
             with plan_col1:
@@ -873,6 +1148,7 @@ with plan_tab:
                     if value != bool(item.get("is_completed", False)):
                         update_plan_item(item["id"], value)
                         st.rerun()
+                    st.caption(f"优先级：{item.get('priority_score', 0)} | {item.get('metadata', {}).get('reason', '')}")
 
                 st.markdown("**先复习什么**")
                 for item in plan.get("priority_review", []):
@@ -884,6 +1160,7 @@ with plan_tab:
                     if value != bool(item.get("is_completed", False)):
                         update_plan_item(item["id"], value)
                         st.rerun()
+                    st.caption(f"优先级：{item.get('priority_score', 0)} | {item.get('metadata', {}).get('reason', '')}")
 
             with plan_col2:
                 st.markdown("**下一步问什么**")
@@ -896,6 +1173,7 @@ with plan_tab:
                     if value != bool(item.get("is_completed", False)):
                         update_plan_item(item["id"], value)
                         st.rerun()
+                    st.caption(f"优先级：{item.get('priority_score', 0)} | {item.get('metadata', {}).get('reason', '')}")
 
                 st.markdown("**行动步骤**")
                 for item in plan.get("action_steps", []):
@@ -907,6 +1185,7 @@ with plan_tab:
                     if value != bool(item.get("is_completed", False)):
                         update_plan_item(item["id"], value)
                         st.rerun()
+                    st.caption(f"优先级：{item.get('priority_score', 0)} | {item.get('metadata', {}).get('reason', '')}")
         else:
             st.caption("点击上方按钮生成并保存计划，或加载当前会话最近一次已保存计划。")
 
@@ -947,3 +1226,25 @@ with report_tab:
                     st.write(f"- {item}")
         else:
             st.caption("点击上方按钮生成当前学习会话的复盘报告。")
+
+with logs_tab:
+    st.subheader("运行日志")
+    if st.button("刷新运行日志", use_container_width=True):
+        load_recent_events(limit=20)
+
+    event_logs = get_current_event_logs()
+    if event_logs:
+        for event in event_logs:
+            with st.container(border=True):
+                st.markdown(f"**{event.get('event_type', 'unknown')}**")
+                st.caption(
+                    f"状态：{event.get('status', 'unknown')} | "
+                    f"耗时：{event.get('duration_ms', 0)} ms | "
+                    f"时间：{event.get('created_at', '')}"
+                )
+                if event.get("message"):
+                    st.write(event["message"])
+                if event.get("metadata"):
+                    st.caption(json.dumps(event.get("metadata", {}), ensure_ascii=False))
+    else:
+        st.caption("点击上方按钮加载当前会话的最近运行日志。")

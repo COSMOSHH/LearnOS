@@ -90,11 +90,13 @@ def delete_study_session(session_id: int, user_id: str) -> bool:
         (session_id,),
     )
     cursor.execute("DELETE FROM quiz_sets WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM wrong_question_attempts WHERE session_id = ?", (session_id,))
     cursor.execute(
         "DELETE FROM study_plan_items WHERE plan_id IN (SELECT id FROM study_plans WHERE session_id = ?)",
         (session_id,),
     )
     cursor.execute("DELETE FROM study_plans WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM event_logs WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM review_items WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM knowledge_points WHERE session_id = ?", (session_id,))
     cursor.execute(

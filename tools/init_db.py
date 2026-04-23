@@ -189,9 +189,41 @@ def init_study_db() -> str:
             item_text TEXT NOT NULL,
             sort_order INTEGER DEFAULT 0,
             is_completed INTEGER DEFAULT 0,
+            priority_score REAL DEFAULT 0,
             metadata_json TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wrong_question_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_item_id INTEGER NOT NULL,
+            session_id INTEGER,
+            user_id TEXT NOT NULL,
+            question_type TEXT,
+            answer_json TEXT,
+            result_json TEXT,
+            total_score REAL DEFAULT 0,
+            status TEXT DEFAULT 'retrying',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            status TEXT DEFAULT 'success',
+            session_id INTEGER,
+            user_id TEXT,
+            duration_ms INTEGER,
+            message TEXT,
+            metadata_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -206,9 +238,17 @@ def init_study_db() -> str:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_attempts_session_user ON quiz_attempts(session_id, user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_study_plans_session_id ON study_plans(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_study_plan_items_plan_id ON study_plan_items(plan_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wrong_question_attempts_review_item ON wrong_question_attempts(review_item_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_created_at ON event_logs(created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_session_id ON event_logs(session_id)")
 
     _ensure_column(cursor, "study_documents", "source_type", "TEXT DEFAULT 'upload'")
     _ensure_column(cursor, "study_documents", "metadata_json", "TEXT")
+    _ensure_column(cursor, "review_items", "mastery_level", "REAL DEFAULT 0")
+    _ensure_column(cursor, "review_items", "last_score", "REAL DEFAULT 0")
+    _ensure_column(cursor, "review_items", "best_score", "REAL DEFAULT 0")
+    _ensure_column(cursor, "review_items", "retry_count", "INTEGER DEFAULT 0")
+    _ensure_column(cursor, "study_plan_items", "priority_score", "REAL DEFAULT 0")
 
     conn.commit()
     conn.close()

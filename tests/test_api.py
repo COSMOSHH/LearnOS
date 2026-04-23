@@ -26,7 +26,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment dependent
     FASTAPI_TESTS_AVAILABLE = False
     FASTAPI_TESTS_REASON = f"fastapi test dependencies are unavailable: {exc}"
 
-from services import document_service, plan_service, quiz_service, review_service, study_session_service
+from services import document_service, observability_service, plan_service, quiz_service, review_service, study_session_service
 from tools import init_db
 
 
@@ -43,6 +43,7 @@ class ApiTests(unittest.TestCase):
 
         init_db.DB_PATH = self.study_db
         document_service.DB_PATH = self.study_db
+        observability_service.DB_PATH = self.study_db
         plan_service.DB_PATH = self.study_db
         quiz_service.DB_PATH = self.study_db
         review_service.DB_PATH = self.study_db
@@ -184,6 +185,42 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(cursor.fetchone()[0], 2)
         conn.close()
 
+    def test_review_queue_wrong_retry_and_events_endpoints(self):
+        session = study_session_service.create_study_session("u1", "复习调度测试", topic="锁", goal="巩固")
+        quiz_set_id = quiz_service.create_quiz_set(session["id"], "测试测验", 1, "medium")
+        quiz_service.save_quiz_questions(
+            quiz_set_id,
+            [
+                {
+                    "question_index": 1,
+                    "question_type": "single_choice",
+                    "question_text": "哪个概念最符合锁住索引记录？",
+                    "reference_answer": "行锁",
+                    "scoring_rubric": "选出最匹配概念。",
+                    "metadata": {"options": ["表锁", "行锁", "间隙锁", "意向锁"], "correct_answer": "行锁"},
+                }
+            ],
+        )
+        submit_resp = self.client.post(
+            f"/study_sessions/{session['id']}/quiz_attempts",
+            json={"user_id": "u1", "quiz_set_id": quiz_set_id, "answers": ["表锁"]},
+        )
+        self.assertEqual(submit_resp.status_code, 200)
+
+        queue_resp = self.client.get("/review_queue", params={"user_id": "u1", "session_id": session["id"], "limit": 5})
+        self.assertEqual(queue_resp.status_code, 200)
+        self.assertGreaterEqual(len(queue_resp.json()["items"]), 1)
+
+        wrong_resp = self.client.get("/wrong_questions", params={"user_id": "u1", "session_id": session["id"]})
+        item_id = wrong_resp.json()["items"][0]["id"]
+        retry_resp = self.client.post(f"/wrong_questions/{item_id}/retry", json={"user_id": "u1", "answer": "行锁"})
+        self.assertEqual(retry_resp.status_code, 200)
+        self.assertEqual(retry_resp.json()["status"], "mastered")
+
+        event_resp = self.client.get("/system/events", params={"session_id": session["id"], "limit": 10})
+        self.assertEqual(event_resp.status_code, 200)
+        self.assertGreaterEqual(len(event_resp.json()["events"]), 1)
+
     def test_delete_session_endpoint_cascades_related_data(self):
         session = study_session_service.create_study_session("u1", "删除测试", topic="删除", goal="验证")
         document_id = document_service.create_document(
@@ -242,6 +279,8 @@ class ApiTests(unittest.TestCase):
             "quiz_sets",
             "quiz_questions",
             "quiz_attempts",
+            "wrong_question_attempts",
+            "event_logs",
         ]:
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
             self.assertEqual(cursor.fetchone()[0], 0, table_name)

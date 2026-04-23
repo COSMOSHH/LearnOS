@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from services.document_service import (
     save_document_summary,
     save_knowledge_points,
 )
+from services.observability_service import list_recent_events, record_event
 from services.plan_service import (
     generate_learning_plan,
     get_latest_learning_plan,
@@ -58,6 +60,9 @@ from services.review_service import (
     create_review_items_from_quiz_feedback,
     get_quiz_feedback_items,
     get_review_items_for_session,
+    list_review_queue,
+    retry_wrong_question,
+    update_review_item_progress,
 )
 from services.study_session_service import create_study_session, delete_study_session, get_study_session, list_study_sessions, update_study_session
 from services.summary_service import infer_session_metadata, summarize_text
@@ -123,7 +128,7 @@ class QuizGenerateRequest(BaseModel):
 class QuizSubmitRequest(BaseModel):
     user_id: str
     quiz_set_id: int
-    answers: list[str]
+    answers: list[object]
 
 
 class PlanGenerateRequest(BaseModel):
@@ -132,6 +137,16 @@ class PlanGenerateRequest(BaseModel):
 
 class PlanItemUpdateRequest(BaseModel):
     is_completed: bool
+
+
+class ReviewProgressRequest(BaseModel):
+    outcome: str
+    notes: str = ""
+
+
+class WrongQuestionRetryRequest(BaseModel):
+    user_id: str
+    answer: object
 
 
 def _ingest_text_resource(
@@ -452,7 +467,37 @@ def _build_learning_plan(session_id: int):
     return {"session_id": session_id, "plan": stored}
 
 
-def _generate_and_save_learning_plan(session_id: int, user_id: str):
+def _record_event_safe(
+    event_type: str,
+    *,
+    status: str = "success",
+    session_id: int | None = None,
+    user_id: str | None = None,
+    duration_ms: int | None = None,
+    message: str = "",
+    metadata: dict | None = None,
+):
+    try:
+        record_event(
+            event_type=event_type,
+            status=status,
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            message=message,
+            metadata=metadata,
+        )
+    except Exception:
+        pass
+
+
+def _generate_and_save_learning_plan(
+    session_id: int,
+    user_id: str,
+    *,
+    preserve_completion: bool = False,
+    source_type: str = "generated",
+):
     session = get_study_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Study session not found.")
@@ -467,7 +512,13 @@ def _generate_and_save_learning_plan(session_id: int, user_id: str):
         latest_quiz_attempt=get_latest_quiz_attempt_for_session(session_id, session["user_id"]),
         llm_generator=llm_generator,
     )
-    plan_id = save_learning_plan(session_id=session_id, user_id=user_id, plan=plan)
+    plan_id = save_learning_plan(
+        session_id=session_id,
+        user_id=user_id,
+        plan=plan,
+        source_type=source_type,
+        preserve_completion=preserve_completion,
+    )
     return {"session_id": session_id, "plan": get_latest_learning_plan(session_id), "plan_id": plan_id}
 
 
@@ -556,7 +607,26 @@ async def delete_session_endpoint(session_id: int, request: SessionDeleteRequest
 
 @app.get("/study_sessions/{session_id}/report")
 async def get_session_report_endpoint(session_id: int):
-    return _build_learning_report(session_id)
+    started = time.perf_counter()
+    try:
+        payload = _build_learning_report(session_id)
+        _record_event_safe(
+            "report.generate",
+            session_id=session_id,
+            user_id=payload["report"].get("user_id"),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"has_report": payload["report"] is not None},
+        )
+        return payload
+    except Exception as exc:
+        _record_event_safe(
+            "report.generate",
+            status="error",
+            session_id=session_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            message=str(exc),
+        )
+        raise
 
 
 @app.get("/study_sessions/{session_id}/plan")
@@ -569,7 +639,57 @@ async def get_session_plan_endpoint(session_id: int, only_incomplete: bool = Que
 
 @app.post("/study_sessions/{session_id}/plan")
 async def generate_session_plan_endpoint(session_id: int, request: PlanGenerateRequest):
-    return _generate_and_save_learning_plan(session_id=session_id, user_id=request.user_id)
+    started = time.perf_counter()
+    try:
+        payload = _generate_and_save_learning_plan(session_id=session_id, user_id=request.user_id)
+        _record_event_safe(
+            "plan.generate",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"plan_id": payload.get("plan_id")},
+        )
+        return payload
+    except Exception as exc:
+        _record_event_safe(
+            "plan.generate",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            message=str(exc),
+        )
+        raise
+
+
+@app.post("/study_sessions/{session_id}/plan/reprioritize")
+async def reprioritize_session_plan_endpoint(session_id: int, request: PlanGenerateRequest):
+    started = time.perf_counter()
+    try:
+        payload = _generate_and_save_learning_plan(
+            session_id=session_id,
+            user_id=request.user_id,
+            preserve_completion=True,
+            source_type="reprioritized",
+        )
+        _record_event_safe(
+            "plan.reprioritize",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"plan_id": payload.get("plan_id")},
+        )
+        return payload
+    except Exception as exc:
+        _record_event_safe(
+            "plan.reprioritize",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            message=str(exc),
+        )
+        raise
 
 
 @app.patch("/study_plans/items/{item_id}")
@@ -578,6 +698,59 @@ async def update_plan_item_endpoint(item_id: int, request: PlanItemUpdateRequest
     if item is None:
         raise HTTPException(status_code=404, detail="Plan item not found.")
     return {"item": item}
+
+
+@app.get("/review_queue")
+async def get_review_queue_endpoint(
+    user_id: str = Query(...),
+    session_id: int | None = Query(None),
+    limit: int = Query(8),
+    due_only: bool = Query(False),
+):
+    return {
+        "items": list_review_queue(
+            user_id=user_id,
+            session_id=session_id,
+            limit=limit,
+            due_only=due_only,
+        )
+    }
+
+
+@app.patch("/review_items/{item_id}/progress")
+async def update_review_item_progress_endpoint(item_id: int, request: ReviewProgressRequest):
+    started = time.perf_counter()
+    try:
+        item = update_review_item_progress(item_id=item_id, outcome=request.outcome, notes=request.notes)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Review item not found.")
+        if item.get("session_id"):
+            try:
+                _generate_and_save_learning_plan(
+                    session_id=item["session_id"],
+                    user_id=item["user_id"],
+                    preserve_completion=True,
+                    source_type="reprioritized",
+                )
+            except Exception:
+                pass
+        _record_event_safe(
+            "review.progress",
+            session_id=item.get("session_id"),
+            user_id=item.get("user_id"),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"item_id": item_id, "outcome": request.outcome},
+        )
+        return {"item": item}
+    except Exception as exc:
+        _record_event_safe(
+            "review.progress",
+            status="error",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"item_id": item_id, "outcome": request.outcome},
+            message=str(exc),
+        )
+        raise
 
 
 @app.get("/wrong_questions")
@@ -597,6 +770,53 @@ async def get_wrong_questions_endpoint(
     for item in items:
         item["session_name"] = session_name_map.get(item.get("session_id"), "")
     return {"items": items}
+
+
+@app.post("/wrong_questions/{item_id}/retry")
+async def retry_wrong_question_endpoint(item_id: int, request: WrongQuestionRetryRequest):
+    started = time.perf_counter()
+    try:
+        payload = retry_wrong_question(item_id, request.user_id, request.answer, llm_generator=llm_generator)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Wrong question item not found.")
+        review_item = payload.get("review_item") or {}
+        if review_item.get("session_id"):
+            try:
+                _generate_and_save_learning_plan(
+                    session_id=review_item["session_id"],
+                    user_id=request.user_id,
+                    preserve_completion=True,
+                    source_type="reprioritized",
+                )
+            except Exception:
+                pass
+        _record_event_safe(
+            "wrong_question.retry",
+            session_id=review_item.get("session_id"),
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"item_id": item_id, "status": payload.get("status")},
+        )
+        return payload
+    except Exception as exc:
+        _record_event_safe(
+            "wrong_question.retry",
+            status="error",
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"item_id": item_id},
+            message=str(exc),
+        )
+        raise
+
+
+@app.get("/system/events")
+async def get_system_events_endpoint(
+    session_id: int | None = Query(None),
+    status: str | None = Query(None),
+    limit: int = Query(30),
+):
+    return {"events": list_recent_events(limit=limit, session_id=session_id, status=status)}
 
 
 @app.post("/study_sessions/{session_id}/documents")
@@ -635,25 +855,65 @@ async def auto_create_session_from_documents_endpoint(
 
 @app.post("/study_sessions/{session_id}/webpages")
 async def import_webpage_endpoint(session_id: int, request: WebpageImportRequest):
-    result = _ingest_webpage_for_session(session_id=session_id, user_id=request.user_id, url=request.url)
-    return {"session_id": session_id, "session": result["session"], "documents": result["documents"]}
+    started = time.perf_counter()
+    try:
+        result = _ingest_webpage_for_session(session_id=session_id, user_id=request.user_id, url=request.url)
+        _record_event_safe(
+            "webpage.import",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"url": request.url},
+        )
+        return {"session_id": session_id, "session": result["session"], "documents": result["documents"]}
+    except Exception as exc:
+        _record_event_safe(
+            "webpage.import",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"url": request.url},
+            message=str(exc),
+        )
+        raise
 
 
 @app.post("/study_sessions/{session_id}/webpages/batch")
 async def import_webpage_batch_endpoint(session_id: int, request: BatchWebpageImportRequest):
-    result = _ingest_webpage_batch_for_session(
-        session_id=session_id,
-        user_id=request.user_id,
-        url=request.url,
-        max_pages=request.max_pages,
-    )
-    return {
-        "session_id": session_id,
-        "session": result["session"],
-        "documents": result["documents"],
-        "imported_count": len(result["documents"]),
-        "source_url": result["batch"]["source_url"],
-    }
+    started = time.perf_counter()
+    try:
+        result = _ingest_webpage_batch_for_session(
+            session_id=session_id,
+            user_id=request.user_id,
+            url=request.url,
+            max_pages=request.max_pages,
+        )
+        _record_event_safe(
+            "webpage.batch_import",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"url": request.url, "imported_count": len(result["documents"])},
+        )
+        return {
+            "session_id": session_id,
+            "session": result["session"],
+            "documents": result["documents"],
+            "imported_count": len(result["documents"]),
+            "source_url": result["batch"]["source_url"],
+        }
+    except Exception as exc:
+        _record_event_safe(
+            "webpage.batch_import",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"url": request.url},
+            message=str(exc),
+        )
+        raise
 
 
 @app.post("/study_sessions/auto_from_webpage")
@@ -703,11 +963,31 @@ async def auto_create_session_from_webpage_batch_endpoint(request: BatchWebpageI
 
 @app.post("/study_sessions/{session_id}/quiz_sets")
 async def generate_quiz_endpoint(session_id: int, request: QuizGenerateRequest):
-    return _build_quiz_bundle_for_session(
-        session_id=session_id,
-        question_count=request.question_count,
-        difficulty=request.difficulty,
-    )
+    started = time.perf_counter()
+    try:
+        payload = _build_quiz_bundle_for_session(
+            session_id=session_id,
+            question_count=request.question_count,
+            difficulty=request.difficulty,
+        )
+        _record_event_safe(
+            "quiz.generate",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metadata={"quiz_set_id": payload.get("quiz_set_id"), "question_count": len(payload.get("questions", []))},
+        )
+        return payload
+    except Exception as exc:
+        _record_event_safe(
+            "quiz.generate",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            message=str(exc),
+        )
+        raise
 
 
 @app.get("/study_sessions/{session_id}/quiz_sets/latest")
@@ -730,6 +1010,7 @@ async def get_latest_quiz_endpoint(session_id: int):
 
 @app.post("/study_sessions/{session_id}/quiz_attempts")
 async def submit_quiz_endpoint(session_id: int, request: QuizSubmitRequest):
+    started = time.perf_counter()
     stored = get_quiz_set_with_questions(request.quiz_set_id)
     if stored is None or stored["quiz_set"]["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Quiz not found for this session.")
@@ -751,6 +1032,27 @@ async def submit_quiz_endpoint(session_id: int, request: QuizSubmitRequest):
         session_id=session_id,
         questions=stored["questions"],
         result=result,
+    )
+    if get_latest_learning_plan(session_id) is not None:
+        try:
+            _generate_and_save_learning_plan(
+                session_id=session_id,
+                user_id=request.user_id,
+                preserve_completion=True,
+                source_type="reprioritized",
+            )
+        except Exception:
+            pass
+    _record_event_safe(
+        "quiz.submit",
+        session_id=session_id,
+        user_id=request.user_id,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        metadata={
+            "quiz_set_id": request.quiz_set_id,
+            "total_score": result.get("total_score", 0),
+            "review_items_created": len(created_review_topics),
+        },
     )
     return {
         "attempt_id": attempt_id,

@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from Zero_RAG import chat_history_service
-from services import document_service, quiz_service, report_service, review_service, study_session_service, webpage_service
+from services import document_service, observability_service, plan_service, quiz_service, report_service, review_service, study_session_service, webpage_service
 from tools import init_db
 
 
@@ -34,6 +34,8 @@ class ServiceTests(unittest.TestCase):
 
         init_db.DB_PATH = self.study_db
         document_service.DB_PATH = self.study_db
+        observability_service.DB_PATH = self.study_db
+        plan_service.DB_PATH = self.study_db
         quiz_service.DB_PATH = self.study_db
         review_service.DB_PATH = self.study_db
         study_session_service.DB_PATH = self.study_db
@@ -138,6 +140,44 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(any(row[1] == "quiz_feedback" for row in rows))
         self.assertTrue(all(row[2] >= 6 for row in rows))
 
+    def test_review_queue_and_wrong_question_retry_update_status(self):
+        session = study_session_service.create_study_session("u1", "错题重练测试", topic="锁", goal="掌握")
+        quiz_set_id = quiz_service.create_quiz_set(session["id"], "测试测验", 2, "medium")
+        quiz_service.save_quiz_questions(
+            quiz_set_id,
+            [
+                {
+                    "question_index": 1,
+                    "question_type": "single_choice",
+                    "question_text": "哪个概念更符合“锁住索引记录”？",
+                    "reference_answer": "行锁",
+                    "scoring_rubric": "选出最匹配的概念。",
+                    "metadata": {"options": ["表锁", "行锁", "间隙锁", "意向锁"], "correct_answer": "行锁"},
+                },
+                {
+                    "question_index": 2,
+                    "question_type": "fill_blank",
+                    "question_text": "填空：防止幻读常见会用到 ____。",
+                    "reference_answer": "间隙锁",
+                    "scoring_rubric": "填出关键术语。",
+                    "metadata": {"blank_answers": ["间隙锁"]},
+                },
+            ],
+        )
+        stored = quiz_service.get_quiz_set_with_questions(quiz_set_id)
+        result = quiz_service.grade_quiz_attempt(stored["questions"], ["表锁", ""], llm_generator=None)
+        created_topics = review_service.create_review_items_from_quiz_feedback("u1", session["id"], stored["questions"], result)
+        self.assertEqual(len(created_topics), 2)
+
+        queue = review_service.list_review_queue("u1", session_id=session["id"], limit=5, due_only=False)
+        self.assertGreaterEqual(len(queue), 2)
+
+        wrong_items = review_service.get_quiz_feedback_items("u1", session_id=session["id"])
+        retry_target = next(item for item in wrong_items if item["question_type"] == "single_choice")
+        retry_result = review_service.retry_wrong_question(retry_target["id"], "u1", "行锁", llm_generator=None)
+        self.assertEqual(retry_result["status"], "mastered")
+        self.assertGreaterEqual(retry_result["result"]["score"], 5.0)
+
     def test_generate_session_report_uses_quiz_result(self):
         report = report_service.generate_session_report(
             session={"session_name": "MySQL 锁", "topic": "锁", "goal": "理解锁"},
@@ -228,6 +268,8 @@ class ServiceTests(unittest.TestCase):
             "quiz_sets",
             "quiz_questions",
             "quiz_attempts",
+            "wrong_question_attempts",
+            "event_logs",
         ]:
             study_cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
             self.assertEqual(study_cursor.fetchone()[0], 0, table_name)
