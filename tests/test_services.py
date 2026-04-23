@@ -6,7 +6,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from Zero_RAG import chat_history_service
-from services import document_service, observability_service, plan_service, quiz_service, report_service, review_service, study_session_service, webpage_service
+from services import (
+    document_service,
+    evaluation_service,
+    interview_service,
+    observability_service,
+    plan_service,
+    quiz_service,
+    report_service,
+    review_service,
+    study_session_service,
+    webpage_service,
+)
 from tools import init_db
 
 
@@ -34,6 +45,8 @@ class ServiceTests(unittest.TestCase):
 
         init_db.DB_PATH = self.study_db
         document_service.DB_PATH = self.study_db
+        evaluation_service.DB_PATH = self.study_db
+        interview_service.DB_PATH = self.study_db
         observability_service.DB_PATH = self.study_db
         plan_service.DB_PATH = self.study_db
         quiz_service.DB_PATH = self.study_db
@@ -198,6 +211,82 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(any("最近一次测验总分为" in item for item in report["progress_snapshot"]))
         self.assertGreaterEqual(len(report["next_actions"]), 1)
 
+    def test_answer_evaluation_interview_flow_and_agent_runs(self):
+        session = study_session_service.create_study_session("u1", "模拟面试测试", topic="MySQL 锁", goal="练习面试表达")
+        document_id = document_service.create_document(
+            session_id=session["id"],
+            title="面试资料",
+            file_name="interview.txt",
+            file_path="/tmp/interview.txt",
+            file_type=".txt",
+            file_size=10,
+            content_hash="interview-1",
+        )
+        knowledge_points = [
+            {"title": "行锁", "description": "锁住索引记录，用于减少并发冲突。", "importance": 4, "difficulty": 3},
+            {"title": "间隙锁", "description": "锁住索引区间，用于防止幻读。", "importance": 4, "difficulty": 4},
+        ]
+        document_service.save_knowledge_points(session["id"], document_id, knowledge_points)
+        summaries = [{"summary_type": "short_summary", "summary_text": "本轮聚焦 MySQL 锁与并发控制。"}]
+        blueprint = interview_service.generate_interview_blueprint(
+            session=session,
+            knowledge_points=knowledge_points,
+            summaries=summaries,
+            total_rounds=2,
+            difficulty="medium",
+            llm_generator=None,
+        )
+        interview_session_id = interview_service.create_interview_session(
+            session_id=session["id"],
+            user_id="u1",
+            title=blueprint["title"],
+            difficulty="medium",
+            total_rounds=2,
+            intro_text=blueprint["intro_text"],
+            questions=blueprint["questions"],
+        )
+
+        first_result = interview_service.submit_interview_answer(
+            interview_session_id=interview_session_id,
+            user_id="u1",
+            answer_text="行锁是锁住索引记录的机制，用于减少并发冲突，并避免多个事务同时改同一行。",
+            llm_generator=None,
+        )
+        self.assertIsNotNone(first_result)
+        self.assertIn(first_result["status"], {"active", "completed"})
+
+        evaluation_id = evaluation_service.save_answer_evaluation(
+            session_id=session["id"],
+            user_id="u1",
+            query_text=first_result["question_text"],
+            answer_text="行锁是锁住索引记录的机制，用于减少并发冲突，并避免多个事务同时改同一行。",
+            evaluation=first_result["evaluation"],
+            source_type="interview",
+            metadata={"interview_session_id": interview_session_id},
+        )
+        self.assertGreater(evaluation_id, 0)
+
+        summary = evaluation_service.summarize_evaluations(session["id"], source_type="interview")
+        self.assertEqual(summary["count"], 1)
+        self.assertGreater(summary["overall_score"], 0)
+
+        run_id = observability_service.create_run(
+            run_type="interview.answer",
+            session_id=session["id"],
+            user_id="u1",
+            title="模拟面试回答",
+            input_summary=first_result["question_text"],
+        )
+        observability_service.add_run_step(run_id, "evaluate", duration_ms=12, metadata={"score": first_result["score"]})
+        observability_service.finish_run(run_id, output_summary="score logged", duration_ms=34)
+
+        runs = observability_service.list_recent_runs(session_id=session["id"], run_type="interview.answer", limit=5)
+        self.assertEqual(len(runs), 1)
+        steps = observability_service.get_run_steps(run_id)
+        self.assertEqual(len(steps), 1)
+        interview_summary = interview_service.summarize_interview_session(interview_session_id)
+        self.assertIn("average_score", interview_summary)
+
     def test_delete_session_cascade_cleanup(self):
         session = study_session_service.create_study_session("u1", "测试会话", topic="测试", goal="测试")
         document_id = document_service.create_document(
@@ -251,6 +340,33 @@ class ServiceTests(unittest.TestCase):
         chat_history_service.save_chat_history("u1", "什么是锁？", "锁用于并发控制。", session_id=session["id"])
         state = chat_history_service.ThreadState(f"thread_u1_{session['id']}")
         chat_history_service.save_thread_state(state)
+        evaluation_service.save_answer_evaluation(
+            session_id=session["id"],
+            user_id="u1",
+            query_text="什么是锁？",
+            answer_text="锁用于并发控制。",
+            evaluation=evaluation_service.evaluate_answer("什么是锁？", "锁用于并发控制。", llm_generator=None),
+            source_type="chat",
+        )
+        interview_session_id = interview_service.create_interview_session(
+            session_id=session["id"],
+            user_id="u1",
+            title="模拟面试",
+            difficulty="medium",
+            total_rounds=1,
+            intro_text="请回答。",
+            questions=[{"round_index": 1, "question_text": "什么是锁？", "ideal_answer": "定义 + 作用", "focus": "锁定义"}],
+        )
+        interview_service.submit_interview_answer(interview_session_id, "u1", "锁用于并发控制。", llm_generator=None)
+        run_id = observability_service.create_run(
+            run_type="study_chat",
+            session_id=session["id"],
+            user_id="u1",
+            title="学习问答",
+            input_summary="什么是锁？",
+        )
+        observability_service.add_run_step(run_id, "retrieve", duration_ms=10)
+        observability_service.finish_run(run_id, output_summary="done", duration_ms=20)
 
         deleted = study_session_service.delete_study_session(session["id"], "u1")
         chat_history_service.delete_session_history("u1", session["id"])
@@ -269,6 +385,11 @@ class ServiceTests(unittest.TestCase):
             "quiz_questions",
             "quiz_attempts",
             "wrong_question_attempts",
+            "answer_evaluations",
+            "interview_sessions",
+            "interview_turns",
+            "agent_runs",
+            "agent_run_steps",
             "event_logs",
         ]:
             study_cursor.execute(f"SELECT COUNT(*) FROM {table_name}")

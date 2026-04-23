@@ -69,6 +69,12 @@ def reset_cached_views():
     st.session_state["plan_session_id"] = None
     st.session_state["report_data"] = None
     st.session_state["report_session_id"] = None
+    st.session_state["evaluation_data"] = None
+    st.session_state["evaluation_session_id"] = None
+    st.session_state["interview_data"] = None
+    st.session_state["interview_session_id"] = None
+    st.session_state["agent_runs_data"] = None
+    st.session_state["agent_runs_session_id"] = None
     st.session_state["event_logs"] = None
     st.session_state["event_logs_session_id"] = None
 
@@ -395,6 +401,22 @@ def refresh_learning_report():
         st.error(extract_error_message(response))
 
 
+def load_answer_evaluations(source_type: str | None = None, limit: int = 20):
+    params = {"limit": limit}
+    if source_type:
+        params["source_type"] = source_type
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/evaluations",
+        params=params,
+        timeout=30,
+    )
+    if response.ok:
+        st.session_state["evaluation_data"] = response.json()
+        st.session_state["evaluation_session_id"] = st.session_state["selected_session_id"]
+    else:
+        st.error(extract_error_message(response))
+
+
 def load_learning_plan(only_incomplete: bool = False):
     response = requests.get(
         f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/plan",
@@ -541,6 +563,74 @@ def load_recent_events(limit: int = 20, status: str | None = None):
         st.error(extract_error_message(response))
 
 
+def load_agent_runs(limit: int = 20, run_type: str | None = None):
+    params = {"limit": limit}
+    if run_type:
+        params["run_type"] = run_type
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/agent_runs",
+        params=params,
+        timeout=30,
+    )
+    if response.ok:
+        st.session_state["agent_runs_data"] = response.json()["runs"]
+        st.session_state["agent_runs_session_id"] = st.session_state["selected_session_id"]
+    else:
+        st.error(extract_error_message(response))
+
+
+def start_interview_session(total_rounds: int, difficulty_label: str):
+    payload = {
+        "user_id": st.session_state["user_id"],
+        "total_rounds": total_rounds,
+        "difficulty": QUIZ_DIFFICULTY_OPTIONS[difficulty_label],
+    }
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/interview_sessions",
+        json=payload,
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["interview_data"] = response.json()
+        st.session_state["interview_session_id"] = st.session_state["selected_session_id"]
+        st.success("模拟面试已开始。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def load_latest_interview_session():
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/interview_sessions/latest",
+        params={"user_id": st.session_state["user_id"]},
+        timeout=30,
+    )
+    if response.ok:
+        st.session_state["interview_data"] = response.json()
+        st.session_state["interview_session_id"] = st.session_state["selected_session_id"]
+    else:
+        st.error(extract_error_message(response))
+
+
+def submit_interview_answer(answer: str):
+    interview_data = get_current_interview_data()
+    interview_session = (interview_data or {}).get("interview_session")
+    if not interview_session:
+        return
+    response = requests.post(
+        f"{API_BASE_URL}/interview_sessions/{interview_session['id']}/answer",
+        json={"user_id": st.session_state["user_id"], "answer": answer},
+        timeout=120,
+    )
+    if response.ok:
+        st.session_state["interview_data"] = response.json()
+        st.session_state["interview_session_id"] = st.session_state["selected_session_id"]
+        load_answer_evaluations(limit=20)
+        load_agent_runs(limit=20)
+        st.success("本轮面试回答已评分。")
+    else:
+        st.error(extract_error_message(response))
+
+
 def render_sources(sources: list[dict]):
     if not sources:
         return
@@ -578,6 +668,12 @@ def get_current_report():
     return None
 
 
+def get_current_evaluation_data():
+    if st.session_state.get("evaluation_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("evaluation_data")
+    return None
+
+
 def get_current_plan():
     if st.session_state.get("plan_session_id") == st.session_state.get("selected_session_id"):
         return st.session_state.get("plan_data")
@@ -597,6 +693,18 @@ def get_current_review_queue():
 def get_current_event_logs():
     if st.session_state.get("event_logs_session_id") == st.session_state.get("selected_session_id"):
         return st.session_state.get("event_logs") or []
+    return []
+
+
+def get_current_interview_data():
+    if st.session_state.get("interview_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("interview_data")
+    return None
+
+
+def get_current_agent_runs():
+    if st.session_state.get("agent_runs_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("agent_runs_data") or []
     return []
 
 
@@ -694,6 +802,18 @@ if "report_data" not in st.session_state:
     st.session_state["report_data"] = None
 if "report_session_id" not in st.session_state:
     st.session_state["report_session_id"] = None
+if "evaluation_data" not in st.session_state:
+    st.session_state["evaluation_data"] = None
+if "evaluation_session_id" not in st.session_state:
+    st.session_state["evaluation_session_id"] = None
+if "interview_data" not in st.session_state:
+    st.session_state["interview_data"] = None
+if "interview_session_id" not in st.session_state:
+    st.session_state["interview_session_id"] = None
+if "agent_runs_data" not in st.session_state:
+    st.session_state["agent_runs_data"] = None
+if "agent_runs_session_id" not in st.session_state:
+    st.session_state["agent_runs_session_id"] = None
 if "plan_data" not in st.session_state:
     st.session_state["plan_data"] = None
 if "plan_session_id" not in st.session_state:
@@ -863,8 +983,8 @@ with st.expander("会话概览", expanded=False):
         st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-chat_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, logs_tab = st.tabs(
-    ["学习问答", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "运行日志"]
+chat_tab, eval_tab, interview_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, logs_tab = st.tabs(
+    ["学习问答", "回答评测", "模拟面试", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "运行观测"]
 )
 
 with chat_tab:
@@ -899,8 +1019,145 @@ with chat_tab:
         try:
             with st.spinner("正在整理回答..."):
                 stream_study_question(user_query, streaming_container)
+                load_answer_evaluations(limit=20)
+                load_agent_runs(limit=20, run_type="study_chat")
         except Exception as exc:
             st.error(f"请求失败：{exc}")
+
+with eval_tab:
+    st.subheader("回答评测")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再查看回答评测。")
+    else:
+        eval_col1, eval_col2 = st.columns([1, 1])
+        with eval_col1:
+            if st.button("刷新问答评测", use_container_width=True):
+                load_answer_evaluations(source_type="chat", limit=20)
+        with eval_col2:
+            if st.button("刷新面试评测", use_container_width=True):
+                load_answer_evaluations(source_type="interview", limit=20)
+
+        evaluation_data = get_current_evaluation_data()
+        if evaluation_data:
+            summary = evaluation_data.get("summary", {})
+            metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+            with metric_col1:
+                st.metric("评测条数", summary.get("count", 0))
+            with metric_col2:
+                st.metric("总分", summary.get("overall_score", 0))
+            with metric_col3:
+                st.metric("准确性", summary.get("accuracy_score", 0))
+            with metric_col4:
+                st.metric("资料依据", summary.get("grounding_score", 0))
+            with metric_col5:
+                st.metric("表达清晰度", summary.get("clarity_score", 0))
+
+            for item in evaluation_data.get("items", []):
+                with st.expander(f"{item.get('source_type', 'chat')} | 总分 {item.get('overall_score', 0)} | {item.get('created_at', '')}", expanded=False):
+                    st.markdown(f"**问题**：{item.get('query_text', '')}")
+                    st.markdown(f"**回答**：{item.get('answer_text', '')}")
+                    st.caption(
+                        f"准确性={item.get('accuracy_score', 0)} | "
+                        f"资料依据={item.get('grounding_score', 0)} | "
+                        f"完整性={item.get('completeness_score', 0)} | "
+                        f"清晰度={item.get('clarity_score', 0)}"
+                    )
+                    st.write(item.get("feedback_text", ""))
+                    metadata = item.get("metadata", {})
+                    if metadata.get("strengths"):
+                        st.markdown("**优点**")
+                        for text in metadata.get("strengths", []):
+                            st.caption(text)
+                    if metadata.get("risks"):
+                        st.markdown("**风险**")
+                        for text in metadata.get("risks", []):
+                            st.caption(text)
+                    if metadata.get("next_actions"):
+                        st.markdown("**下一步建议**")
+                        for text in metadata.get("next_actions", []):
+                            st.caption(text)
+        else:
+            st.caption("先进行学习问答或模拟面试，再刷新这里查看回答质量评测。")
+
+with interview_tab:
+    st.subheader("模拟面试")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再开始模拟面试。")
+    else:
+        interview_col1, interview_col2 = st.columns([1, 1])
+        with interview_col1:
+            interview_rounds = st.slider("面试轮数", min_value=2, max_value=5, value=3)
+        with interview_col2:
+            interview_difficulty = st.selectbox("面试难度", options=list(QUIZ_DIFFICULTY_OPTIONS.keys()), index=1, key="interview_difficulty")
+
+        interview_action_col1, interview_action_col2 = st.columns([1, 1])
+        with interview_action_col1:
+            if st.button("开始新一轮模拟面试", use_container_width=True):
+                start_interview_session(interview_rounds, interview_difficulty)
+        with interview_action_col2:
+            if st.button("加载最近一次模拟面试", use_container_width=True):
+                load_latest_interview_session()
+
+        interview_data = get_current_interview_data()
+        if interview_data and interview_data.get("interview_session"):
+            interview_session = interview_data["interview_session"]
+            st.markdown(f"**{interview_session.get('title', '模拟面试')}**")
+            if interview_session.get("intro_text"):
+                st.write(interview_session["intro_text"])
+            st.caption(
+                f"状态：{interview_session.get('status', 'active')} | "
+                f"轮数：{interview_session.get('current_round', 1)} / {interview_session.get('total_rounds', 0)} | "
+                f"难度：{interview_session.get('difficulty', 'medium')}"
+            )
+
+            turns = interview_data.get("turns", [])
+            current_turn = next((turn for turn in turns if not turn.get("answer_text")), None)
+            if current_turn is not None:
+                st.markdown(f"**当前问题（第 {current_turn.get('round_index', 1)} 轮）**")
+                st.write(current_turn.get("question_text", ""))
+                interview_answer = st.text_area(
+                    "面试回答",
+                    key=f"interview_answer_{interview_session['id']}_{current_turn.get('round_index', 1)}",
+                    placeholder="像技术面试一样回答：先结论，再解释原理、场景和取舍。",
+                    height=150,
+                )
+                if st.button("提交本轮回答", use_container_width=True):
+                    submit_interview_answer(interview_answer)
+                    st.rerun()
+
+            st.divider()
+            st.markdown("**面试过程**")
+            for turn in turns:
+                with st.expander(f"第 {turn.get('round_index')} 轮 | 得分 {turn.get('score', 0)}", expanded=False):
+                    st.markdown(f"**问题**：{turn.get('question_text', '')}")
+                    if turn.get("answer_text"):
+                        st.markdown(f"**回答**：{turn.get('answer_text', '')}")
+                        st.caption(turn.get("feedback_text", ""))
+                        metadata = turn.get("metadata", {})
+                        if metadata.get("ideal_answer"):
+                            st.markdown("**理想回答要点**")
+                            st.write(metadata.get("ideal_answer"))
+                        if turn.get("follow_up_question"):
+                            st.markdown("**建议追问**")
+                            st.write(turn.get("follow_up_question"))
+
+            if interview_data.get("summary"):
+                summary = interview_data["summary"]
+                st.divider()
+                st.markdown("**面试总结**")
+                st.write(summary.get("overview", ""))
+                st.metric("平均分", summary.get("average_score", 0))
+                st.markdown("**优势**")
+                for text in summary.get("strengths", []):
+                    st.caption(text)
+                st.markdown("**风险**")
+                for text in summary.get("risks", []):
+                    st.caption(text)
+                st.markdown("**下一步建议**")
+                for text in summary.get("next_actions", []):
+                    st.caption(text)
+        else:
+            st.caption("点击上方按钮开始一轮模拟面试，系统会基于当前会话资料自动生成问题。")
 
 with quiz_tab:
     st.subheader("测验模式")
@@ -1228,12 +1485,43 @@ with report_tab:
             st.caption("点击上方按钮生成当前学习会话的复盘报告。")
 
 with logs_tab:
-    st.subheader("运行日志")
-    if st.button("刷新运行日志", use_container_width=True):
-        load_recent_events(limit=20)
+    st.subheader("运行观测")
+    logs_col1, logs_col2 = st.columns([1, 1])
+    with logs_col1:
+        if st.button("刷新 agent runs", use_container_width=True):
+            load_agent_runs(limit=20)
+    with logs_col2:
+        if st.button("刷新事件日志", use_container_width=True):
+            load_recent_events(limit=20)
+
+    agent_runs = get_current_agent_runs()
+    if agent_runs:
+        st.markdown("**Agent Runs**")
+        for run in agent_runs:
+            with st.expander(f"{run.get('run_type', 'unknown')} | {run.get('status', 'unknown')} | {run.get('started_at', '')}", expanded=False):
+                st.caption(
+                    f"标题：{run.get('title', '')} | "
+                    f"耗时：{run.get('duration_ms', 0)} ms | "
+                    f"输入：{run.get('input_summary', '')}"
+                )
+                if run.get("output_summary"):
+                    st.write(run.get("output_summary"))
+                if run.get("steps"):
+                    st.markdown("**步骤**")
+                    for step in run.get("steps", []):
+                        st.caption(
+                            f"{step.get('step_name', '')} | "
+                            f"状态={step.get('step_status', '')} | "
+                            f"耗时={step.get('duration_ms', 0)} ms | "
+                            f"{step.get('message', '')}"
+                        )
 
     event_logs = get_current_event_logs()
+    if not agent_runs and not event_logs:
+        st.caption("点击上方按钮加载当前会话的运行观测信息。")
+
     if event_logs:
+        st.markdown("**事件日志**")
         for event in event_logs:
             with st.container(border=True):
                 st.markdown(f"**{event.get('event_type', 'unknown')}**")
@@ -1246,5 +1534,3 @@ with logs_tab:
                     st.write(event["message"])
                 if event.get("metadata"):
                     st.caption(json.dumps(event.get("metadata", {}), ensure_ascii=False))
-    else:
-        st.caption("点击上方按钮加载当前会话的最近运行日志。")

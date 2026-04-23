@@ -26,7 +26,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment dependent
     FASTAPI_TESTS_AVAILABLE = False
     FASTAPI_TESTS_REASON = f"fastapi test dependencies are unavailable: {exc}"
 
-from services import document_service, observability_service, plan_service, quiz_service, review_service, study_session_service
+from services import (
+    document_service,
+    evaluation_service,
+    interview_service,
+    observability_service,
+    plan_service,
+    quiz_service,
+    review_service,
+    study_session_service,
+)
 from tools import init_db
 
 
@@ -43,6 +52,8 @@ class ApiTests(unittest.TestCase):
 
         init_db.DB_PATH = self.study_db
         document_service.DB_PATH = self.study_db
+        evaluation_service.DB_PATH = self.study_db
+        interview_service.DB_PATH = self.study_db
         observability_service.DB_PATH = self.study_db
         plan_service.DB_PATH = self.study_db
         quiz_service.DB_PATH = self.study_db
@@ -221,6 +232,58 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(event_resp.status_code, 200)
         self.assertGreaterEqual(len(event_resp.json()["events"]), 1)
 
+    def test_interview_evaluation_and_agent_runs_endpoints(self):
+        session = study_session_service.create_study_session("u1", "模拟面试接口测试", topic="锁", goal="练习表达")
+        document_id = document_service.create_document(
+            session_id=session["id"],
+            title="面试资料",
+            file_name="a.txt",
+            file_path="a.txt",
+            file_type=".txt",
+            file_size=10,
+            content_hash="interview-api",
+        )
+        document_service.save_knowledge_points(
+            session["id"],
+            document_id,
+            [
+                {"title": "行锁", "description": "锁住索引记录。", "importance": 3, "difficulty": 3},
+                {"title": "间隙锁", "description": "锁住索引区间。", "importance": 4, "difficulty": 4},
+            ],
+        )
+        document_service.save_document_summary(document_id, "short_summary", "本轮聚焦锁机制。")
+
+        start_resp = self.client.post(
+            f"/study_sessions/{session['id']}/interview_sessions",
+            json={"user_id": "u1", "total_rounds": 2, "difficulty": "medium"},
+        )
+        self.assertEqual(start_resp.status_code, 200)
+        start_payload = start_resp.json()
+        interview_session = start_payload["interview_session"]
+        self.assertIsNotNone(interview_session)
+
+        answer_resp = self.client.post(
+            f"/interview_sessions/{interview_session['id']}/answer",
+            json={"user_id": "u1", "answer": "行锁是锁住索引记录的机制，用于减少并发冲突。"},
+        )
+        self.assertEqual(answer_resp.status_code, 200)
+        self.assertIn("result", answer_resp.json())
+
+        evaluation_resp = self.client.get(
+            f"/study_sessions/{session['id']}/evaluations",
+            params={"source_type": "interview", "limit": 10},
+        )
+        self.assertEqual(evaluation_resp.status_code, 200)
+        self.assertGreaterEqual(evaluation_resp.json()["summary"]["count"], 1)
+
+        runs_resp = self.client.get(
+            f"/study_sessions/{session['id']}/agent_runs",
+            params={"limit": 10},
+        )
+        self.assertEqual(runs_resp.status_code, 200)
+        run_types = {item["run_type"] for item in runs_resp.json()["runs"]}
+        self.assertTrue({"interview.start", "interview.answer"} & run_types)
+
     def test_delete_session_endpoint_cascades_related_data(self):
         session = study_session_service.create_study_session("u1", "删除测试", topic="删除", goal="验证")
         document_id = document_service.create_document(
@@ -260,6 +323,33 @@ class ApiTests(unittest.TestCase):
             {"total_score": 4, "overall_feedback": "ok", "item_feedback": [{"question_index": 1, "score": 4, "max_score": 5, "feedback": "ok", "suggestion": ""}]},
         )
         chat_history_service.save_chat_history("u1", "q", "a", session_id=session["id"])
+        evaluation_service.save_answer_evaluation(
+            session_id=session["id"],
+            user_id="u1",
+            query_text="q",
+            answer_text="a",
+            evaluation=evaluation_service.evaluate_answer("q", "a", llm_generator=None),
+            source_type="chat",
+        )
+        interview_session_id = interview_service.create_interview_session(
+            session_id=session["id"],
+            user_id="u1",
+            title="模拟面试",
+            difficulty="medium",
+            total_rounds=1,
+            intro_text="请回答",
+            questions=[{"round_index": 1, "question_text": "Q", "ideal_answer": "A", "focus": "核心概念"}],
+        )
+        interview_service.submit_interview_answer(interview_session_id, "u1", "A", llm_generator=None)
+        run_id = observability_service.create_run(
+            run_type="study_chat",
+            session_id=session["id"],
+            user_id="u1",
+            title="学习问答",
+            input_summary="q",
+        )
+        observability_service.add_run_step(run_id, "retrieve", duration_ms=10)
+        observability_service.finish_run(run_id, output_summary="a", duration_ms=20)
 
         resp = self.client.request("DELETE", f"/study_sessions/{session['id']}", json={"user_id": "u1"})
         self.assertEqual(resp.status_code, 200)
@@ -280,6 +370,11 @@ class ApiTests(unittest.TestCase):
             "quiz_questions",
             "quiz_attempts",
             "wrong_question_attempts",
+            "answer_evaluations",
+            "interview_sessions",
+            "interview_turns",
+            "agent_runs",
+            "agent_run_steps",
             "event_logs",
         ]:
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}")

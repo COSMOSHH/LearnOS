@@ -36,7 +36,17 @@ from services.document_service import (
     save_document_summary,
     save_knowledge_points,
 )
-from services.observability_service import list_recent_events, record_event
+from services.evaluation_service import evaluate_answer, list_answer_evaluations, save_answer_evaluation, summarize_evaluations
+from services.interview_service import (
+    create_interview_session,
+    generate_interview_blueprint,
+    get_interview_session,
+    get_interview_turns,
+    get_latest_interview_session,
+    submit_interview_answer,
+    summarize_interview_session,
+)
+from services.observability_service import add_run_step, create_run, finish_run, get_run_steps, list_recent_events, list_recent_runs, record_event
 from services.plan_service import (
     generate_learning_plan,
     get_latest_learning_plan,
@@ -147,6 +157,17 @@ class ReviewProgressRequest(BaseModel):
 class WrongQuestionRetryRequest(BaseModel):
     user_id: str
     answer: object
+
+
+class InterviewStartRequest(BaseModel):
+    user_id: str
+    total_rounds: int = 3
+    difficulty: str = "medium"
+
+
+class InterviewAnswerRequest(BaseModel):
+    user_id: str
+    answer: str
 
 
 def _ingest_text_resource(
@@ -458,6 +479,15 @@ def _build_learning_report(session_id: int):
     return {"session_id": session_id, "report": report}
 
 
+def _build_interview_session_payload(session_id: int, user_id: str):
+    session = get_latest_interview_session(session_id, user_id)
+    if session is None:
+        return {"interview_session": None, "turns": [], "summary": None}
+    turns = get_interview_turns(session["id"])
+    summary = summarize_interview_session(session["id"]) if session.get("status") == "completed" else None
+    return {"interview_session": session, "turns": turns, "summary": summary}
+
+
 def _build_learning_plan(session_id: int):
     session = get_study_session(session_id)
     if not session:
@@ -487,6 +517,24 @@ def _record_event_safe(
             message=message,
             metadata=metadata,
         )
+    except Exception:
+        pass
+
+
+def _record_run_step_safe(run_id: int | None, step_name: str, **kwargs):
+    if not run_id:
+        return
+    try:
+        add_run_step(run_id=run_id, step_name=step_name, **kwargs)
+    except Exception:
+        pass
+
+
+def _finish_run_safe(run_id: int | None, **kwargs):
+    if not run_id:
+        return
+    try:
+        finish_run(run_id=run_id, **kwargs)
     except Exception:
         pass
 
@@ -819,6 +867,150 @@ async def get_system_events_endpoint(
     return {"events": list_recent_events(limit=limit, session_id=session_id, status=status)}
 
 
+@app.get("/study_sessions/{session_id}/evaluations")
+async def get_session_evaluations_endpoint(
+    session_id: int,
+    source_type: str | None = Query(None),
+    limit: int = Query(20),
+):
+    return {
+        "session_id": session_id,
+        "summary": summarize_evaluations(session_id, source_type=source_type),
+        "items": list_answer_evaluations(session_id, source_type=source_type, limit=limit),
+    }
+
+
+@app.get("/study_sessions/{session_id}/agent_runs")
+async def get_session_agent_runs_endpoint(session_id: int, run_type: str | None = Query(None), limit: int = Query(20)):
+    runs = list_recent_runs(session_id=session_id, run_type=run_type, limit=limit)
+    for run in runs:
+        run["steps"] = get_run_steps(run["id"])
+    return {"session_id": session_id, "runs": runs}
+
+
+@app.post("/study_sessions/{session_id}/interview_sessions")
+async def start_interview_session_endpoint(session_id: int, request: InterviewStartRequest):
+    started = time.perf_counter()
+    run_id = create_run(
+        run_type="interview.start",
+        session_id=session_id,
+        user_id=request.user_id,
+        title="模拟面试启动",
+        input_summary=f"rounds={request.total_rounds}, difficulty={request.difficulty}",
+    )
+    try:
+        session = get_study_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Study session not found.")
+        if session["user_id"] != request.user_id:
+            raise HTTPException(status_code=403, detail="You do not have access to this session.")
+
+        blueprint = generate_interview_blueprint(
+            session=session,
+            knowledge_points=get_session_knowledge_points(session_id),
+            summaries=get_session_summaries(session_id),
+            total_rounds=request.total_rounds,
+            difficulty=request.difficulty,
+            llm_generator=llm_generator,
+        )
+        _record_run_step_safe(run_id, "blueprint.generate", duration_ms=0, metadata={"questions": len(blueprint.get("questions", []))})
+        interview_session_id = create_interview_session(
+            session_id=session_id,
+            user_id=request.user_id,
+            title=blueprint["title"],
+            difficulty=request.difficulty,
+            total_rounds=request.total_rounds,
+            intro_text=blueprint["intro_text"],
+            questions=blueprint["questions"],
+        )
+        payload = _build_interview_session_payload(session_id, request.user_id)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _finish_run_safe(run_id, status="success", output_summary=f"interview_session_id={interview_session_id}", duration_ms=duration_ms)
+        _record_event_safe(
+            "interview.start",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            metadata={"interview_session_id": interview_session_id, "rounds": request.total_rounds},
+        )
+        return {"session_id": session_id, **payload}
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _record_run_step_safe(run_id, "interview.start.error", step_status="error", duration_ms=duration_ms, message=str(exc))
+        _finish_run_safe(run_id, status="error", output_summary=str(exc), duration_ms=duration_ms)
+        _record_event_safe(
+            "interview.start",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            message=str(exc),
+        )
+        raise
+
+
+@app.get("/study_sessions/{session_id}/interview_sessions/latest")
+async def get_latest_interview_session_endpoint(session_id: int, user_id: str = Query(...)):
+    return {"session_id": session_id, **_build_interview_session_payload(session_id, user_id)}
+
+
+@app.post("/interview_sessions/{interview_session_id}/answer")
+async def submit_interview_answer_endpoint(interview_session_id: int, request: InterviewAnswerRequest):
+    started = time.perf_counter()
+    interview_session = get_interview_session(interview_session_id)
+    if interview_session is None:
+        raise HTTPException(status_code=404, detail="Interview session not found.")
+    session_id = interview_session["session_id"]
+    run_id = create_run(
+        run_type="interview.answer",
+        session_id=session_id,
+        user_id=request.user_id,
+        title="模拟面试答题",
+        input_summary=request.answer[:120],
+        metadata={"interview_session_id": interview_session_id},
+    )
+    try:
+        payload = submit_interview_answer(interview_session_id, request.user_id, request.answer, llm_generator=llm_generator)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Interview session not found.")
+        _record_run_step_safe(run_id, "interview.evaluate", duration_ms=0, metadata={"score": payload.get("score", 0), "status": payload.get("status")})
+        evaluation = payload.get("evaluation", {})
+        save_answer_evaluation(
+            session_id=session_id,
+            user_id=request.user_id,
+            query_text=payload.get("question_text", "模拟面试问题"),
+            answer_text=request.answer,
+            evaluation=evaluation,
+            source_type="interview",
+            metadata={"interview_session_id": interview_session_id},
+        )
+        response_payload = _build_interview_session_payload(session_id, request.user_id)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _finish_run_safe(run_id, status="success", output_summary=f"score={payload.get('score', 0)}", duration_ms=duration_ms)
+        _record_event_safe(
+            "interview.answer",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            metadata={"interview_session_id": interview_session_id, "score": payload.get("score", 0), "status": payload.get("status")},
+        )
+        return {"session_id": session_id, "result": payload, **response_payload}
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _record_run_step_safe(run_id, "interview.answer.error", step_status="error", duration_ms=duration_ms, message=str(exc))
+        _finish_run_safe(run_id, status="error", output_summary=str(exc), duration_ms=duration_ms)
+        _record_event_safe(
+            "interview.answer",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            metadata={"interview_session_id": interview_session_id},
+            message=str(exc),
+        )
+        raise
+
+
 @app.post("/study_sessions/{session_id}/documents")
 async def upload_documents_endpoint(
     session_id: int,
@@ -1103,8 +1295,18 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=400, detail="No indexed study materials were found for this session.")
 
     try:
+        run_started = time.perf_counter()
         retrieved_results = retriever.retrieve(request.query)
         sources = _format_sources(retrieved_results)
+        run_id = create_run(
+            run_type="study_chat",
+            session_id=request.session_id,
+            user_id=request.user_id,
+            title="学习问答",
+            input_summary=request.query[:160],
+            metadata={"source_count": len(sources)},
+        )
+        _record_run_step_safe(run_id, "retrieve", duration_ms=0, metadata={"source_count": len(sources)})
 
         raw_history = get_user_history(request.user_id, session_id=request.session_id)[-6:]
         chat_history = []
@@ -1123,6 +1325,7 @@ async def chat_endpoint(request: ChatRequest):
         def generate_stream():
             full_response = ""
             try:
+                generation_started = time.perf_counter()
                 for chunk in llm_generator.generate_answer_stream(
                     request.query,
                     retrieved_results,
@@ -1132,6 +1335,12 @@ async def chat_endpoint(request: ChatRequest):
                     full_response += chunk
                     yield json.dumps({"chunk": chunk}, ensure_ascii=False) + "\n"
 
+                _record_run_step_safe(
+                    run_id,
+                    "generate_answer",
+                    duration_ms=int((time.perf_counter() - generation_started) * 1000),
+                    metadata={"response_length": len(full_response)},
+                )
                 yield json.dumps({"sources": sources, "review_items": review_context["items"]}, ensure_ascii=False) + "\n"
                 save_chat_history(
                     request.user_id,
@@ -1140,8 +1349,44 @@ async def chat_endpoint(request: ChatRequest):
                     session_id=request.session_id,
                     sources=sources,
                 )
+                evaluation = evaluate_answer(
+                    query_text=request.query,
+                    answer_text=full_response,
+                    sources=sources,
+                    llm_generator=llm_generator,
+                    source_type="chat",
+                )
+                evaluation_id = save_answer_evaluation(
+                    session_id=request.session_id,
+                    user_id=request.user_id,
+                    query_text=request.query,
+                    answer_text=full_response,
+                    evaluation=evaluation,
+                    source_type="chat",
+                    metadata={"source_count": len(sources)},
+                )
+                _record_run_step_safe(
+                    run_id,
+                    "evaluate_answer",
+                    duration_ms=0,
+                    metadata={"evaluation_id": evaluation_id, "overall_score": evaluation.get("overall_score", 0)},
+                )
+                _finish_run_safe(
+                    run_id,
+                    status="success",
+                    output_summary=full_response[:180],
+                    duration_ms=int((time.perf_counter() - run_started) * 1000),
+                    metadata={"evaluation_score": evaluation.get("overall_score", 0)},
+                )
             except Exception as inner_exc:
                 error_msg = f"\n\n[backend streaming error: {inner_exc}]"
+                _record_run_step_safe(run_id, "study_chat.error", step_status="error", message=str(inner_exc))
+                _finish_run_safe(
+                    run_id,
+                    status="error",
+                    output_summary=str(inner_exc),
+                    duration_ms=int((time.perf_counter() - run_started) * 1000),
+                )
                 yield json.dumps({"chunk": error_msg}, ensure_ascii=False) + "\n"
 
         return StreamingResponse(generate_stream(), media_type="application/x-ndjson")

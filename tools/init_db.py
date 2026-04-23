@@ -227,6 +227,96 @@ def init_study_db() -> str:
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS answer_evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
+            user_id TEXT NOT NULL,
+            source_type TEXT DEFAULT 'chat',
+            query_text TEXT NOT NULL,
+            answer_text TEXT NOT NULL,
+            overall_score REAL DEFAULT 0,
+            accuracy_score REAL DEFAULT 0,
+            grounding_score REAL DEFAULT 0,
+            completeness_score REAL DEFAULT 0,
+            clarity_score REAL DEFAULT 0,
+            feedback_text TEXT,
+            metadata_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interview_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            difficulty TEXT DEFAULT 'medium',
+            total_rounds INTEGER DEFAULT 3,
+            current_round INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'active',
+            intro_text TEXT,
+            summary_text TEXT,
+            metadata_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interview_turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            interview_session_id INTEGER NOT NULL,
+            round_index INTEGER NOT NULL,
+            question_text TEXT NOT NULL,
+            answer_text TEXT,
+            ideal_answer TEXT,
+            follow_up_question TEXT,
+            feedback_text TEXT,
+            score REAL DEFAULT 0,
+            metadata_json TEXT,
+            asked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            answered_at DATETIME
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_type TEXT NOT NULL,
+            session_id INTEGER,
+            user_id TEXT,
+            status TEXT DEFAULT 'running',
+            title TEXT,
+            input_summary TEXT,
+            output_summary TEXT,
+            duration_ms INTEGER,
+            metadata_json TEXT,
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            finished_at DATETIME
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_run_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            step_name TEXT NOT NULL,
+            step_status TEXT DEFAULT 'success',
+            duration_ms INTEGER,
+            message TEXT,
+            metadata_json TEXT,
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            finished_at DATETIME
+        )
+        """
+    )
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_date ON study_sessions(user_id, session_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_documents_session_id ON study_documents(session_id)")
@@ -241,6 +331,11 @@ def init_study_db() -> str:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wrong_question_attempts_review_item ON wrong_question_attempts(review_item_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_created_at ON event_logs(created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_session_id ON event_logs(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_answer_evaluations_session_id ON answer_evaluations(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_interview_sessions_session_id ON interview_sessions(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_interview_turns_session_id ON interview_turns(interview_session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_session_id ON agent_runs(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_run_steps_run_id ON agent_run_steps(run_id)")
 
     _ensure_column(cursor, "study_documents", "source_type", "TEXT DEFAULT 'upload'")
     _ensure_column(cursor, "study_documents", "metadata_json", "TEXT")

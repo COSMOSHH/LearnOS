@@ -96,6 +96,17 @@ def delete_study_session(session_id: int, user_id: str) -> bool:
         (session_id,),
     )
     cursor.execute("DELETE FROM study_plans WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM answer_evaluations WHERE session_id = ?", (session_id,))
+    cursor.execute(
+        "DELETE FROM interview_turns WHERE interview_session_id IN (SELECT id FROM interview_sessions WHERE session_id = ?)",
+        (session_id,),
+    )
+    cursor.execute("DELETE FROM interview_sessions WHERE session_id = ?", (session_id,))
+    cursor.execute(
+        "DELETE FROM agent_run_steps WHERE run_id IN (SELECT id FROM agent_runs WHERE session_id = ?)",
+        (session_id,),
+    )
+    cursor.execute("DELETE FROM agent_runs WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM event_logs WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM review_items WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM knowledge_points WHERE session_id = ?", (session_id,))
