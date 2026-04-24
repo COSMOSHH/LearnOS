@@ -279,6 +279,7 @@ def stream_study_question(user_query: str, container):
     full_answer = ""
     sources = []
     review_items = []
+    retrieval_debug = {}
 
     with container:
         with st.chat_message("user"):
@@ -297,10 +298,13 @@ def stream_study_question(user_query: str, container):
                     sources = data["sources"]
                 if "review_items" in data:
                     review_items = data["review_items"]
+                if "retrieval_debug" in data:
+                    retrieval_debug = data["retrieval_debug"]
 
             answer_placeholder.markdown(full_answer)
             render_sources(sources)
             render_review_items(review_items)
+            render_retrieval_debug(retrieval_debug)
 
     st.session_state["messages"].append({"role": "user", "content": user_query})
     st.session_state["messages"].append(
@@ -309,6 +313,7 @@ def stream_study_question(user_query: str, container):
             "content": full_answer,
             "sources": sources,
             "review_items": review_items,
+            "retrieval_debug": retrieval_debug,
         }
     )
 
@@ -636,10 +641,10 @@ def render_sources(sources: list[dict]):
         return
     with st.expander("参考来源"):
         for source in sources:
-            st.caption(
-                f"{source.get('document_title') or source['source']} | "
-                f"分数={source.get('score', 0):.4f} | 分片={source.get('chunk_index')}"
-            )
+            label = source.get("document_title") or source["source"]
+            if source.get("section_title"):
+                label = f"{label} / {source.get('section_title')}"
+            st.caption(f"{label} | 分数={source.get('score', 0):.4f} | 分片={source.get('chunk_index')}")
 
 
 def render_review_items(review_items: list[dict]):
@@ -648,6 +653,44 @@ def render_review_items(review_items: list[dict]):
     with st.expander("复习提醒"):
         for item in review_items:
             st.caption(f"{item['topic']}: {item['summary']}")
+
+
+def render_retrieval_debug(retrieval_debug: dict | None):
+    if not retrieval_debug:
+        return
+    with st.expander("检索调试", expanded=False):
+        st.caption(
+            f"原始问题：{retrieval_debug.get('original_query', '')}\n"
+            f"\n改写问题：{retrieval_debug.get('rewritten_query', '')}\n"
+            f"\n改写原因：{retrieval_debug.get('rewrite_reason', '')}"
+        )
+
+        vector_candidates = retrieval_debug.get("vector_candidates", [])
+        if vector_candidates:
+            st.markdown("**向量召回 Top-K**")
+            for item in vector_candidates:
+                st.caption(
+                    f"{item.get('document_title', '')} / {item.get('section_title', '')} | "
+                    f"分片={item.get('chunk_index')} | distance={item.get('distance')}"
+                )
+
+        bm25_candidates = retrieval_debug.get("bm25_candidates", [])
+        if bm25_candidates:
+            st.markdown("**BM25 Top-K**")
+            for item in bm25_candidates:
+                st.caption(
+                    f"{item.get('document_title', '')} / {item.get('section_title', '')} | "
+                    f"分片={item.get('chunk_index')} | bm25={item.get('bm25_score', 0):.4f}"
+                )
+
+        reranked_results = retrieval_debug.get("reranked_results", [])
+        if reranked_results:
+            st.markdown("**Rerank 结果**")
+            for item in reranked_results:
+                st.caption(
+                    f"{item.get('document_title', '')} / {item.get('section_title', '')} | "
+                    f"分片={item.get('chunk_index')} | rerank={item.get('rerank_score', 0):.4f}"
+                )
 
 
 def get_current_quiz_bundle():
@@ -996,6 +1039,7 @@ with chat_tab:
                 st.write(message["content"])
                 render_sources(message.get("sources", []))
                 render_review_items(message.get("review_items", []))
+                render_retrieval_debug(message.get("retrieval_debug", {}))
 
     streaming_container = st.container()
 
@@ -1506,6 +1550,13 @@ with logs_tab:
                 )
                 if run.get("output_summary"):
                     st.write(run.get("output_summary"))
+                if run.get("metadata"):
+                    metadata = run.get("metadata", {})
+                    retrieval_debug = metadata.get("retrieval_debug")
+                    if retrieval_debug:
+                        render_retrieval_debug(retrieval_debug)
+                    else:
+                        st.caption(json.dumps(metadata, ensure_ascii=False))
                 if run.get("steps"):
                     st.markdown("**步骤**")
                     for step in run.get("steps", []):

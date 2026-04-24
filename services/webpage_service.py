@@ -54,13 +54,15 @@ def fetch_webpage_content(url: str, timeout: int = 20) -> dict:
 
     title = ""
     content = ""
+    sections = []
 
     if BeautifulSoup is not None:
-        title, content = _extract_with_bs4(html)
+        title, content, sections = _extract_with_bs4(html)
 
     if not content:
         title = title or _extract_title_with_regex(html)
         content = _extract_content_with_regex(html)
+        sections = _build_fallback_sections(title or parsed.netloc, content)
 
     content = _normalize_text(content)
     title = _normalize_text(title).splitlines()[0] if title else ""
@@ -77,6 +79,7 @@ def fetch_webpage_content(url: str, timeout: int = 20) -> dict:
         "text": content,
         "source_url": response.url,
         "site_name": parsed.netloc,
+        "sections": sections,
     }
 
 
@@ -155,7 +158,7 @@ def _decode_html(response: requests.Response) -> str:
     return raw_bytes.decode("utf-8", errors="replace")
 
 
-def _extract_with_bs4(html: str) -> tuple[str, str]:
+def _extract_with_bs4(html: str) -> tuple[str, str, list[dict]]:
     soup = BeautifulSoup(html, "html.parser")
     for tag_name in ["script", "style", "noscript", "svg", "footer", "nav", "aside", "form", "button"]:
         for tag in soup.find_all(tag_name):
@@ -186,24 +189,73 @@ def _extract_with_bs4(html: str) -> tuple[str, str]:
     elif soup.title:
         title = soup.title.get_text(" ", strip=True)
 
-    pieces = []
+    sections = []
+    current_headings: dict[int, str] = {}
+    current_section: dict | None = None
     selectors = ["h1", "h2", "h3", "h4", "p", "li", "pre", "blockquote"]
     for element in root.find_all(selectors):
         text = element.get_text("\n" if element.name == "pre" else " ", strip=True)
         text = _normalize_text(text)
         if not text:
             continue
-        if pieces and text == pieces[-1]:
+        if element.name in {"h1", "h2", "h3", "h4"}:
+            level = int(element.name[1])
+            current_headings[level] = text
+            current_headings = {key: value for key, value in current_headings.items() if key <= level}
+            heading_path = " > ".join(current_headings[key] for key in sorted(current_headings))
+            current_section = {
+                "section_title": text,
+                "heading_path": heading_path or text,
+                "content_parts": [],
+                "chunk_type": "heading_section",
+            }
+            sections.append(current_section)
             continue
-        pieces.append(text)
 
-    if not pieces and root:
+        if current_section is None:
+            current_section = {
+                "section_title": title or "正文",
+                "heading_path": title or "正文",
+                "content_parts": [],
+                "chunk_type": "body_section",
+            }
+            sections.append(current_section)
+
+        if current_section["content_parts"] and text == current_section["content_parts"][-1]:
+            continue
+        current_section["content_parts"].append(text)
+
+    if not sections and root:
         fallback_text = root.get_text("\n", strip=True)
         fallback_text = _normalize_text(fallback_text)
         if fallback_text:
-            pieces.append(fallback_text)
+            sections.append(
+                {
+                    "section_title": title or "正文",
+                    "heading_path": title or "正文",
+                    "content_parts": [fallback_text],
+                    "chunk_type": "fallback_section",
+                }
+            )
 
-    return title, "\n\n".join(pieces)
+    normalized_sections = []
+    pieces = []
+    for section in sections:
+        content_parts = [item for item in section.get("content_parts", []) if item]
+        content = _normalize_text("\n\n".join(content_parts))
+        if not content:
+            continue
+        normalized_sections.append(
+            {
+                "section_title": section.get("section_title") or title or "正文",
+                "heading_path": section.get("heading_path") or title or "正文",
+                "content": content,
+                "chunk_type": section.get("chunk_type", "section"),
+            }
+        )
+        pieces.append(content)
+
+    return title, "\n\n".join(pieces), normalized_sections
 
 
 def _extract_same_site_links(html: str, base_url: str) -> list[str]:
@@ -307,6 +359,20 @@ def _extract_content_with_regex(html: str) -> str:
             return _html_fragment_to_text(fragment[: body_end + 7])
 
     return _html_fragment_to_text(html)
+
+
+def _build_fallback_sections(title: str, content: str) -> list[dict]:
+    normalized_content = _normalize_text(content)
+    if not normalized_content:
+        return []
+    return [
+        {
+            "section_title": title or "正文",
+            "heading_path": title or "正文",
+            "content": normalized_content,
+            "chunk_type": "fallback_section",
+        }
+    ]
 
 
 def _html_fragment_to_text(fragment: str) -> str:

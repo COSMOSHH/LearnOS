@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from Zero_RAG import chat_history_service
+from Zero_RAG.RAG.text_splitter import SemanticTextSplitter
 from services import (
     document_service,
     evaluation_service,
     interview_service,
     observability_service,
     plan_service,
+    query_service,
     quiz_service,
     report_service,
     review_service,
@@ -114,6 +116,24 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(len(batch["pages"]), 2)
         self.assertEqual({item["title"] for item in batch["pages"]}, {"文章A", "文章B"})
+        self.assertTrue(all(page.get("sections") for page in batch["pages"]))
+
+    def test_query_rewrite_and_heading_enhanced_chunking(self):
+        rewritten = query_service.rewrite_query(
+            "这个有什么区别？",
+            history=[{"role": "user", "content": "redo log 和 undo log 是什么"}],
+            session_context="MySQL 锁与事务",
+            llm_generator=None,
+        )
+        self.assertIn("补充追问", rewritten["rewritten_query"])
+
+        splitter = SemanticTextSplitter(chunk_size=80, chunk_overlap=10)
+        chunks = splitter.split_text_with_metadata(
+            "# MySQL 锁\n## 行锁\n行锁用于锁住索引记录。\n## 间隙锁\n间隙锁用于防止幻读。",
+            document_title="MySQL 锁",
+        )
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertTrue(any("行锁" in item["heading_path"] for item in chunks))
 
     def test_quiz_generation_grading_and_low_score_review_sink(self):
         session = {"session_name": "MySQL 锁", "topic": "锁机制", "goal": "理解原理"}

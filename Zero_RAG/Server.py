@@ -53,6 +53,7 @@ from services.plan_service import (
     save_learning_plan,
     update_plan_item_completion,
 )
+from services.query_service import rewrite_query
 from services.quiz_service import (
     create_quiz_set,
     generate_quiz_bundle,
@@ -201,14 +202,25 @@ def _ingest_text_resource(
     )
 
     splitter = SemanticTextSplitter(chunk_size=config.chunk_size, chunk_overlap=config.chunk_overlap)
-    chunks = splitter.split_text(normalized_text)
-    if not chunks:
-        chunks = [normalized_text]
+    chunk_records = splitter.split_text_with_metadata(
+        normalized_text,
+        document_title=title,
+        section_items=(metadata or {}).get("sections"),
+    )
+    if not chunk_records:
+        chunk_records = [
+            {
+                "text": normalized_text,
+                "section_title": title,
+                "heading_path": title,
+                "chunk_type": "fallback",
+            }
+        ]
 
     source_reference = (metadata or {}).get("source_url") or (metadata or {}).get("source") or file_path
     metadatas = []
     ids = []
-    for chunk_index, _ in enumerate(chunks):
+    for chunk_index, chunk_record in enumerate(chunk_records):
         metadatas.append(
             {
                 "source": source_reference,
@@ -217,10 +229,14 @@ def _ingest_text_resource(
                 "session_id": str(session_id),
                 "chunk_index": chunk_index,
                 "source_type": source_type,
+                "section_title": chunk_record.get("section_title", title),
+                "heading_path": chunk_record.get("heading_path", title),
+                "chunk_type": chunk_record.get("chunk_type", "section"),
             }
         )
         ids.append(f"session_{session_id}_doc_{document_id}_chunk_{chunk_index}")
 
+    chunks = [item["text"] for item in chunk_records]
     vector_store.add_documents(documents=chunks, metadatas=metadatas, ids=ids)
     save_document_chunks(
         document_id=document_id,
@@ -230,6 +246,7 @@ def _ingest_text_resource(
             "session_id": session_id,
             "source": source_reference,
             "source_type": source_type,
+            "document_title": title,
         },
     )
 
@@ -362,6 +379,7 @@ def _ingest_webpage_for_session(session_id: int, user_id: str, url: str):
             "source": webpage["source_url"],
             "source_url": webpage["source_url"],
             "site_name": webpage["site_name"],
+            "sections": webpage.get("sections", []),
         },
     )
     updated_session = _refresh_session_metadata(session_id, [display_name], [preview_text])
@@ -402,6 +420,7 @@ def _ingest_webpage_batch_for_session(session_id: int, user_id: str, url: str, m
                 "site_name": page["site_name"],
                 "import_mode": "batch_webpage",
                 "batch_source_url": batch["source_url"],
+                "sections": page.get("sections", []),
             },
         )
         created_documents.append(created_document)
@@ -600,6 +619,8 @@ def _format_sources(retrieved_results: list[dict]) -> list[dict]:
                 "score": item.get("score", 0.0),
                 "source": metadata.get("source", "unknown"),
                 "document_title": metadata.get("document_title", ""),
+                "section_title": metadata.get("section_title", ""),
+                "heading_path": metadata.get("heading_path", ""),
                 "chunk_index": metadata.get("chunk_index"),
             }
         )
@@ -614,6 +635,14 @@ def _build_extra_system_context(review_text: str) -> str:
         "Keep the review section brief and clearly separated from the main answer.\n"
         f"{review_text}"
     )
+
+
+def _build_session_context_text(session_id: int) -> str:
+    session = get_study_session(session_id)
+    if not session:
+        return ""
+    parts = [session.get("session_name", ""), session.get("topic", ""), session.get("goal", "")]
+    return " | ".join([part for part in parts if part])
 
 
 @app.post("/study_sessions")
@@ -1269,7 +1298,13 @@ async def agent_chat_endpoint(request: ChatRequest):
         if request.session_id is not None:
             retriever, _ = _build_session_retriever(request.session_id)
             if retriever:
-                retrieved_results = retriever.retrieve(request.query)
+                rewrite_payload = rewrite_query(
+                    request.query,
+                    history=[],
+                    session_context=_build_session_context_text(request.session_id),
+                    llm_generator=llm_generator,
+                )
+                retrieved_results = retriever.retrieve(rewrite_payload["rewritten_query"])
                 state.user_info["rag_context"] = "\n".join(
                     [f"- {item['metadata'].get('source', 'unknown')}: {item['document']}" for item in retrieved_results]
                 )
@@ -1296,7 +1331,27 @@ async def chat_endpoint(request: ChatRequest):
 
     try:
         run_started = time.perf_counter()
-        retrieved_results = retriever.retrieve(request.query)
+        raw_history = get_user_history(request.user_id, session_id=request.session_id)[-6:]
+        chat_history = []
+        for item in raw_history:
+            chat_history.append({"role": "user", "content": item["query"]})
+            chat_history.append({"role": "assistant", "content": item["response"]})
+
+        rewrite_payload = rewrite_query(
+            request.query,
+            history=chat_history,
+            session_context=_build_session_context_text(request.session_id),
+            llm_generator=llm_generator,
+        )
+        retrieve_started = time.perf_counter()
+        retrieved_results, retrieval_debug = retriever.retrieve_with_debug(rewrite_payload["rewritten_query"])
+        retrieval_debug.update(
+            {
+                "original_query": rewrite_payload["original_query"],
+                "rewritten_query": rewrite_payload["rewritten_query"],
+                "rewrite_reason": rewrite_payload["rewrite_reason"],
+            }
+        )
         sources = _format_sources(retrieved_results)
         run_id = create_run(
             run_type="study_chat",
@@ -1304,15 +1359,24 @@ async def chat_endpoint(request: ChatRequest):
             user_id=request.user_id,
             title="学习问答",
             input_summary=request.query[:160],
-            metadata={"source_count": len(sources)},
+            metadata={
+                "source_count": len(sources),
+                "original_query": rewrite_payload["original_query"],
+                "rewritten_query": rewrite_payload["rewritten_query"],
+                "rewrite_reason": rewrite_payload["rewrite_reason"],
+                "retrieval_debug": retrieval_debug,
+            },
         )
-        _record_run_step_safe(run_id, "retrieve", duration_ms=0, metadata={"source_count": len(sources)})
-
-        raw_history = get_user_history(request.user_id, session_id=request.session_id)[-6:]
-        chat_history = []
-        for item in raw_history:
-            chat_history.append({"role": "user", "content": item["query"]})
-            chat_history.append({"role": "assistant", "content": item["response"]})
+        _record_run_step_safe(
+            run_id,
+            "retrieve",
+            duration_ms=int((time.perf_counter() - retrieve_started) * 1000),
+            metadata={
+                "source_count": len(sources),
+                "original_query": rewrite_payload["original_query"],
+                "rewritten_query": rewrite_payload["rewritten_query"],
+            },
+        )
 
         review_context = build_review_context(
             user_id=request.user_id,
@@ -1341,7 +1405,10 @@ async def chat_endpoint(request: ChatRequest):
                     duration_ms=int((time.perf_counter() - generation_started) * 1000),
                     metadata={"response_length": len(full_response)},
                 )
-                yield json.dumps({"sources": sources, "review_items": review_context["items"]}, ensure_ascii=False) + "\n"
+                yield json.dumps(
+                    {"sources": sources, "review_items": review_context["items"], "retrieval_debug": retrieval_debug},
+                    ensure_ascii=False,
+                ) + "\n"
                 save_chat_history(
                     request.user_id,
                     request.query,
