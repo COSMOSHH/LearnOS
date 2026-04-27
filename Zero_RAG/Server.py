@@ -25,6 +25,7 @@ from RAG.vector_store import ChromaDBStore
 from agent_engine import run_agent_cycle
 from chat_history_service import delete_session_history, get_user_history, init_db, load_thread_state, save_chat_history
 from llm_generator import LLMGenerator
+from services.context_service import build_generation_context
 from services.document_service import (
     calculate_content_hash,
     create_document,
@@ -53,7 +54,8 @@ from services.plan_service import (
     save_learning_plan,
     update_plan_item_completion,
 )
-from services.query_service import rewrite_query
+from services.query_service import expand_query_to_multi_queries, rewrite_query
+from services.rag_eval_service import build_eval_dataset_template, evaluate_retrieval_cases
 from services.quiz_service import (
     create_quiz_set,
     generate_quiz_bundle,
@@ -113,6 +115,20 @@ class ChatRequest(BaseModel):
     user_id: str = "default_user"
     session_id: int | None = None
     query: str
+
+
+class RetrievalEvalCase(BaseModel):
+    query: str
+    relevant_sources: list[str] = []
+    relevant_titles: list[str] = []
+    relevant_keywords: list[str] = []
+
+
+class RetrievalEvalRequest(BaseModel):
+    user_id: str = "default_user"
+    cases: list[RetrievalEvalCase]
+    top_k: int = 5
+    low_quality_mrr_threshold: float = 0.5
 
 
 class WebpageImportRequest(BaseModel):
@@ -917,6 +933,102 @@ async def get_session_agent_runs_endpoint(session_id: int, run_type: str | None 
     return {"session_id": session_id, "runs": runs}
 
 
+@app.get("/study_sessions/{session_id}/rag/eval_dataset_template")
+async def get_rag_eval_dataset_template_endpoint(session_id: int):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    documents = get_session_documents(session_id)
+    return {
+        "session_id": session_id,
+        "case_count": len(documents),
+        "cases": build_eval_dataset_template(documents),
+    }
+
+
+@app.post("/study_sessions/{session_id}/rag/evaluate")
+async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEvalRequest):
+    started = time.perf_counter()
+    retriever, doc_chunks = _build_session_retriever(session_id)
+    if not retriever or not doc_chunks:
+        raise HTTPException(status_code=400, detail="No indexed study materials were found for this session.")
+
+    run_id = create_run(
+        run_type="rag.evaluate",
+        session_id=session_id,
+        user_id=request.user_id,
+        title="RAG 检索评测",
+        input_summary=f"case_count={len(request.cases)}",
+        metadata={"top_k": request.top_k, "threshold": request.low_quality_mrr_threshold},
+    )
+
+    try:
+        payload = evaluate_retrieval_cases(
+            retriever,
+            [item.model_dump() for item in request.cases],
+            rewrite_query=rewrite_query,
+            expand_query_to_multi_queries=expand_query_to_multi_queries,
+            session_context=_build_session_context_text(session_id),
+            llm_generator=llm_generator,
+            top_k=request.top_k,
+            low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+        )
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _record_run_step_safe(
+            run_id,
+            "rag.evaluate.retrieval",
+            duration_ms=duration_ms,
+            metadata={
+                "case_count": payload.get("case_count", 0),
+                "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "low_quality_count": len(payload.get("low_quality_cases", [])),
+            },
+        )
+        _finish_run_safe(
+            run_id,
+            status="success",
+            output_summary=f"mrr={payload.get('metrics', {}).get('mrr', 0)}",
+            duration_ms=duration_ms,
+            metadata={
+                "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "low_quality_count": len(payload.get("low_quality_cases", [])),
+            },
+        )
+        _record_event_safe(
+            "rag.evaluate",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            metadata={
+                "case_count": payload.get("case_count", 0),
+                "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "low_quality_count": len(payload.get("low_quality_cases", [])),
+            },
+        )
+        return {"session_id": session_id, **payload}
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _record_run_step_safe(
+            run_id,
+            "rag.evaluate.error",
+            step_status="error",
+            duration_ms=duration_ms,
+            message=str(exc),
+        )
+        _finish_run_safe(run_id, status="error", output_summary=str(exc), duration_ms=duration_ms)
+        _record_event_safe(
+            "rag.evaluate",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            message=str(exc),
+        )
+        raise
+
+
 @app.post("/study_sessions/{session_id}/interview_sessions")
 async def start_interview_session_endpoint(session_id: int, request: InterviewStartRequest):
     started = time.perf_counter()
@@ -1304,7 +1416,17 @@ async def agent_chat_endpoint(request: ChatRequest):
                     session_context=_build_session_context_text(request.session_id),
                     llm_generator=llm_generator,
                 )
-                retrieved_results = retriever.retrieve(rewrite_payload["rewritten_query"])
+                expanded_query_payload = expand_query_to_multi_queries(
+                    original_query=request.query,
+                    rewritten_query=rewrite_payload["rewritten_query"],
+                    session_context=_build_session_context_text(request.session_id),
+                    llm_generator=llm_generator,
+                )
+                retrieved_results, _ = retriever.retrieve_with_debug(
+                    rewrite_payload["rewritten_query"],
+                    queries=expanded_query_payload["queries"],
+                )
+                retrieved_results, _ = build_generation_context(retrieved_results)
                 state.user_info["rag_context"] = "\n".join(
                     [f"- {item['metadata'].get('source', 'unknown')}: {item['document']}" for item in retrieved_results]
                 )
@@ -1343,16 +1465,29 @@ async def chat_endpoint(request: ChatRequest):
             session_context=_build_session_context_text(request.session_id),
             llm_generator=llm_generator,
         )
+        expanded_query_payload = expand_query_to_multi_queries(
+            original_query=request.query,
+            rewritten_query=rewrite_payload["rewritten_query"],
+            session_context=_build_session_context_text(request.session_id),
+            llm_generator=llm_generator,
+        )
         retrieve_started = time.perf_counter()
-        retrieved_results, retrieval_debug = retriever.retrieve_with_debug(rewrite_payload["rewritten_query"])
+        retrieved_results, retrieval_debug = retriever.retrieve_with_debug(
+            rewrite_payload["rewritten_query"],
+            queries=expanded_query_payload["queries"],
+        )
+        generation_results, context_debug = build_generation_context(retrieved_results)
         retrieval_debug.update(
             {
                 "original_query": rewrite_payload["original_query"],
                 "rewritten_query": rewrite_payload["rewritten_query"],
                 "rewrite_reason": rewrite_payload["rewrite_reason"],
+                "query_strategy": expanded_query_payload["strategy"],
+                "expanded_queries": expanded_query_payload["queries"],
+                "context_debug": context_debug,
             }
         )
-        sources = _format_sources(retrieved_results)
+        sources = _format_sources(generation_results)
         run_id = create_run(
             run_type="study_chat",
             session_id=request.session_id,
@@ -1364,6 +1499,8 @@ async def chat_endpoint(request: ChatRequest):
                 "original_query": rewrite_payload["original_query"],
                 "rewritten_query": rewrite_payload["rewritten_query"],
                 "rewrite_reason": rewrite_payload["rewrite_reason"],
+                "query_strategy": expanded_query_payload["strategy"],
+                "expanded_queries": expanded_query_payload["queries"],
                 "retrieval_debug": retrieval_debug,
             },
         )
@@ -1375,6 +1512,9 @@ async def chat_endpoint(request: ChatRequest):
                 "source_count": len(sources),
                 "original_query": rewrite_payload["original_query"],
                 "rewritten_query": rewrite_payload["rewritten_query"],
+                "query_strategy": expanded_query_payload["strategy"],
+                "expanded_queries": expanded_query_payload["queries"],
+                "context_debug": context_debug,
             },
         )
 
@@ -1392,7 +1532,7 @@ async def chat_endpoint(request: ChatRequest):
                 generation_started = time.perf_counter()
                 for chunk in llm_generator.generate_answer_stream(
                     request.query,
-                    retrieved_results,
+                    generation_results,
                     history=chat_history,
                     extra_system_context=extra_system_context,
                 ):
@@ -1468,4 +1608,4 @@ async def get_history_endpoint(user_id: str, session_id: int | None = None):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8888)

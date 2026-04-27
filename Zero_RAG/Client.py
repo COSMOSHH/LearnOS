@@ -1,4 +1,4 @@
-import json
+﻿import json
 import mimetypes
 from datetime import datetime
 
@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 
 
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = "http://127.0.0.1:8888"
 DEFAULT_USER_ID = "learnos_local_user"
 
 SUMMARY_TYPE_LABELS = {
@@ -665,12 +665,18 @@ def render_retrieval_debug(retrieval_debug: dict | None):
             f"\n改写原因：{retrieval_debug.get('rewrite_reason', '')}"
         )
 
+        expanded_queries = retrieval_debug.get("expanded_queries", [])
+        if expanded_queries:
+            st.markdown(f"**Multi-Query 策略**: `{retrieval_debug.get('query_strategy', 'single_query')}`")
+            for index, item in enumerate(expanded_queries, start=1):
+                st.caption(f"Q{index}: {item}")
+
         vector_candidates = retrieval_debug.get("vector_candidates", [])
         if vector_candidates:
             st.markdown("**向量召回 Top-K**")
             for item in vector_candidates:
                 st.caption(
-                    f"{item.get('document_title', '')} / {item.get('section_title', '')} | "
+                    f"[{item.get('query', '')}] {item.get('document_title', '')} / {item.get('section_title', '')} | "
                     f"分片={item.get('chunk_index')} | distance={item.get('distance')}"
                 )
 
@@ -679,7 +685,7 @@ def render_retrieval_debug(retrieval_debug: dict | None):
             st.markdown("**BM25 Top-K**")
             for item in bm25_candidates:
                 st.caption(
-                    f"{item.get('document_title', '')} / {item.get('section_title', '')} | "
+                    f"[{item.get('query', '')}] {item.get('document_title', '')} / {item.get('section_title', '')} | "
                     f"分片={item.get('chunk_index')} | bm25={item.get('bm25_score', 0):.4f}"
                 )
 
@@ -691,6 +697,21 @@ def render_retrieval_debug(retrieval_debug: dict | None):
                     f"{item.get('document_title', '')} / {item.get('section_title', '')} | "
                     f"分片={item.get('chunk_index')} | rerank={item.get('rerank_score', 0):.4f}"
                 )
+
+        context_debug = retrieval_debug.get("context_debug") or {}
+        if context_debug:
+            st.markdown("**Context Compression**")
+            st.caption(
+                f"context before={context_debug.get('before_count', 0)} | "
+                f"after={context_debug.get('after_count', 0)} | "
+                f"deduped={context_debug.get('deduped', 0)} | "
+                f"truncated={context_debug.get('truncated', 0)} | "
+                f"context chars={context_debug.get('final_context_chars', 0)}"
+            )
+
+        parent_enriched = retrieval_debug.get("parent_enriched", 0)
+        if parent_enriched:
+            st.caption(f"Parent-Child 回填次数: {parent_enriched}")
 
 
 def get_current_quiz_bundle():
@@ -976,11 +997,11 @@ with st.expander("会话概览", expanded=False):
         knowledge_points = detail.get("knowledge_points", [])
         review_items = detail.get("review_items", [])
 
-        st.markdown(f"**会话名称：** {session['session_name']}")
+        st.markdown(f"**会话名称： {session['session_name']}")
         if session.get("topic"):
-            st.markdown(f"**学习主题：** {session['topic']}")
+            st.markdown(f"**学习主题： {session['topic']}")
         if session.get("goal"):
-            st.markdown(f"**学习目标：** {session['goal']}")
+            st.markdown(f"**学习目标： {session['goal']}")
 
         st.divider()
         st.markdown("**资料列表**")
@@ -1006,7 +1027,7 @@ with st.expander("会话概览", expanded=False):
             st.caption("当前还没有摘要。")
 
         st.divider()
-        st.markdown("**知识点**")
+        st.markdown("**知识点")
         if knowledge_points:
             for point in knowledge_points:
                 st.markdown(f"**{point['title']}**")
@@ -1015,7 +1036,7 @@ with st.expander("会话概览", expanded=False):
             st.caption("当前还没有知识点。")
 
         st.divider()
-        st.markdown("**复习项**")
+        st.markdown("**复习项")
         if review_items:
             for item in review_items:
                 st.markdown(f"**{item['topic']}**")
@@ -1117,7 +1138,7 @@ with eval_tab:
                         for text in metadata.get("risks", []):
                             st.caption(text)
                     if metadata.get("next_actions"):
-                        st.markdown("**下一步建议**")
+                        st.markdown("**下一步建议")
                         for text in metadata.get("next_actions", []):
                             st.caption(text)
         else:
@@ -1157,7 +1178,7 @@ with interview_tab:
             turns = interview_data.get("turns", [])
             current_turn = next((turn for turn in turns if not turn.get("answer_text")), None)
             if current_turn is not None:
-                st.markdown(f"**当前问题（第 {current_turn.get('round_index', 1)} 轮）**")
+                st.markdown(f"**褰撳墠闂锛堢 {current_turn.get('round_index', 1)} 杞級**")
                 st.write(current_turn.get("question_text", ""))
                 interview_answer = st.text_area(
                     "面试回答",
@@ -1197,7 +1218,7 @@ with interview_tab:
                 st.markdown("**风险**")
                 for text in summary.get("risks", []):
                     st.caption(text)
-                st.markdown("**下一步建议**")
+                st.markdown("**下一步建议")
                 for text in summary.get("next_actions", []):
                     st.caption(text)
         else:
@@ -1350,11 +1371,11 @@ with wrong_tab:
                     retry_wrong_question_action(item["id"], retry_answer)
                     st.rerun()
                 if item.get("retry_history"):
-                    st.markdown("**最近状态演进**")
+                    st.markdown("**最近状态演进")
                     for history in item.get("retry_history", []):
                         st.caption(
                             f"{history.get('created_at') or history.get('retried_at', '')} | "
-                            f"状态={history.get('status', '')} | "
+                            f"状态：{history.get('status', '')} | "
                             f"得分={history.get('total_score', history.get('score', 0))}"
                         )
     else:
@@ -1439,7 +1460,7 @@ with plan_tab:
 
             plan_col1, plan_col2 = st.columns(2)
             with plan_col1:
-                st.markdown("**今天学什么**")
+                st.markdown("**今天学什么")
                 for item in plan.get("today_focus", []):
                     value = st.checkbox(
                         item["text"],
@@ -1451,7 +1472,7 @@ with plan_tab:
                         st.rerun()
                     st.caption(f"优先级：{item.get('priority_score', 0)} | {item.get('metadata', {}).get('reason', '')}")
 
-                st.markdown("**先复习什么**")
+                st.markdown("**先复习什么")
                 for item in plan.get("priority_review", []):
                     value = st.checkbox(
                         item["text"],
@@ -1464,7 +1485,7 @@ with plan_tab:
                     st.caption(f"优先级：{item.get('priority_score', 0)} | {item.get('metadata', {}).get('reason', '')}")
 
             with plan_col2:
-                st.markdown("**下一步问什么**")
+                st.markdown("**下一步问什么")
                 for item in plan.get("next_questions", []):
                     value = st.checkbox(
                         item["text"],
@@ -1509,7 +1530,7 @@ with report_tab:
                 for item in report.get("progress_snapshot", []):
                     st.write(f"- {item}")
 
-                st.markdown("**当前优势**")
+                st.markdown("**褰撳墠优势**")
                 for item in report.get("strengths", []):
                     st.write(f"- {item}")
 
@@ -1522,7 +1543,7 @@ with report_tab:
                 for item in report.get("risks", []):
                     st.write(f"- {item}")
 
-                st.markdown("**下一步建议**")
+                st.markdown("**下一步建议")
                 for item in report.get("next_actions", []):
                     st.write(f"- {item}")
         else:
@@ -1562,7 +1583,7 @@ with logs_tab:
                     for step in run.get("steps", []):
                         st.caption(
                             f"{step.get('step_name', '')} | "
-                            f"状态={step.get('step_status', '')} | "
+                            f"状态：{step.get('step_status', '')} | "
                             f"耗时={step.get('duration_ms', 0)} ms | "
                             f"{step.get('message', '')}"
                         )
@@ -1585,3 +1606,5 @@ with logs_tab:
                     st.write(event["message"])
                 if event.get("metadata"):
                     st.caption(json.dumps(event.get("metadata", {}), ensure_ascii=False))
+
+

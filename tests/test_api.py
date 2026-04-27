@@ -381,6 +381,63 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(cursor.fetchone()[0], 0, table_name)
         conn.close()
 
+    def test_rag_eval_template_and_evaluate_endpoints(self):
+        session = study_session_service.create_study_session("u1", "RAG评测测试", topic="锁", goal="评测")
+        document_service.create_document(
+            session_id=session["id"],
+            title="MySQL 锁",
+            file_name="lock.md",
+            file_path="docs/lock.md",
+            file_type=".md",
+            file_size=10,
+            content_hash="rag-eval",
+        )
+
+        template_resp = self.client.get(f"/study_sessions/{session['id']}/rag/eval_dataset_template")
+        self.assertEqual(template_resp.status_code, 200)
+        self.assertGreaterEqual(template_resp.json()["case_count"], 1)
+
+        class FakeRetriever:
+            def retrieve_with_debug(self, query, queries=None):
+                return (
+                    [
+                        {
+                            "document": "行锁用于锁住索引记录。",
+                            "metadata": {
+                                "source": "docs/lock.md",
+                                "document_title": "MySQL 锁",
+                                "section_title": "行锁",
+                                "chunk_index": 0,
+                            },
+                            "score": 0.9,
+                        }
+                    ],
+                    {"debug": "ok"},
+                )
+
+        with patch("Zero_RAG.Server._build_session_retriever", return_value=(FakeRetriever(), [{"chunk_text": "x", "metadata": {}}])):
+            eval_resp = self.client.post(
+                f"/study_sessions/{session['id']}/rag/evaluate",
+                json={
+                    "user_id": "u1",
+                    "top_k": 3,
+                    "low_quality_mrr_threshold": 0.5,
+                    "cases": [
+                        {
+                            "query": "什么是行锁",
+                            "relevant_sources": ["docs/lock.md"],
+                            "relevant_titles": ["MySQL 锁"],
+                            "relevant_keywords": ["行锁"],
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(eval_resp.status_code, 200)
+        payload = eval_resp.json()
+        self.assertEqual(payload["case_count"], 1)
+        self.assertGreaterEqual(payload["metrics"]["mrr"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -366,3 +366,18 @@
 ## 7. 一句话结论
 
 LearnOS 当前最缺的不是“换一个更大的向量库”，而是把查询优化、结构化分块、上下文治理和检索评测这四条链路补完整。
+
+## V1.2 当前进度
+
+`RAG V1.2` 已完成，当前落地情况如下：
+
+1. `Multi-Query / 子问题分解`
+   已在 `services/query_service.py` 中实现 `expand_query_to_multi_queries()`，并接入学习问答与 agent chat 的检索前链路。
+2. `Parent-Child 多粒度检索`
+   已在 `Zero_RAG/RAG/hybrid_retriever.py` 中实现章节级父块聚合和回填，检索命中 child chunk 后会按章节组装 parent context。
+3. `Context Compression`
+   已新增 `services/context_service.py`，对 rerank 后结果执行去重、压缩和长度裁剪，再进入生成阶段。
+4. `检索调试可视化增强`
+   已补充展示 Multi-Query 策略、扩展 query、Parent-Child 回填次数和 Context Compression 调试信息。
+
+这意味着 LearnOS 当前的 RAG 已经从 `RAG V1.1` 进一步升级到“带查询扩展、多粒度上下文和上下文治理”的版本。

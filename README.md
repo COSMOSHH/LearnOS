@@ -245,3 +245,20 @@ streamlit run Zero_RAG/Client.py
 3. [第一阶段实施任务拆解.md](第一阶段实施任务拆解.md)
 4. [数据库表结构设计.md](数据库表结构设计.md)
 5. [学习辅助Agent项目改造计划.md](学习辅助Agent项目改造计划.md)
+
+## RAG V1.2 更新
+
+当前已完成 `RAG V1.2`，主要新增了三项能力：
+
+1. `Multi-Query / 子问题分解`
+   学习问答会在 Query Rewrite 之后继续做多查询扩展，针对对比题、原因题、总结题自动拆成 2 到 4 个检索子问题，提升复杂问题召回覆盖率。
+2. `Parent-Child 多粒度检索`
+   检索阶段优先命中细粒度 chunk，进入生成前会按 `document_id + heading_path` 回填同章节父级上下文，兼顾定位精度和上下文完整性。
+3. `Context Compression`
+   Rerank 后新增上下文治理，包含近重复 chunk 去重、单片段压缩和总上下文长度裁剪，减少噪声与 token 浪费。
+
+现在在“学习问答”和“运行观测”里，除了能看到原始 query、改写 query、向量召回、BM25 和 rerank，还能看到：
+
+1. `Multi-Query` 策略与扩展出的检索子问题
+2. `Parent-Child` 回填次数
+3. `Context Compression` 的去重、截断和最终上下文长度统计
