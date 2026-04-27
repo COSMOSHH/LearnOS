@@ -396,6 +396,12 @@ class ApiTests(unittest.TestCase):
         template_resp = self.client.get(f"/study_sessions/{session['id']}/rag/eval_dataset_template")
         self.assertEqual(template_resp.status_code, 200)
         self.assertGreaterEqual(template_resp.json()["case_count"], 1)
+        auto_cases_resp = self.client.get(
+            f"/study_sessions/{session['id']}/rag/eval_cases",
+            params={"limit": 5},
+        )
+        self.assertEqual(auto_cases_resp.status_code, 200)
+        self.assertGreaterEqual(auto_cases_resp.json()["case_count"], 1)
 
         class FakeRetriever:
             def retrieve_with_debug(self, query, queries=None):

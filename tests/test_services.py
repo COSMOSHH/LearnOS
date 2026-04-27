@@ -240,6 +240,34 @@ class ServiceTests(unittest.TestCase):
         self.assertAlmostEqual(payload["metrics"]["mrr"], 0.5)
         self.assertGreaterEqual(len(payload["low_quality_cases"]), 1)
 
+    def test_build_session_eval_cases_matches_topic_keywords(self):
+        session = {
+            "session_name": "MySQL 锁机制",
+            "topic": "事务与锁",
+            "goal": "理解行锁、间隙锁和 next-key lock",
+        }
+        documents = [
+            {"title": "MySQL 是怎么加锁的？", "file_name": "lock.md", "file_path": "docs/lock.md"},
+            {"title": "MySQL 日志系统", "file_name": "log.md", "file_path": "docs/log.md"},
+        ]
+        knowledge_points = [
+            {"title": "行锁", "description": "锁住索引记录"},
+            {"title": "next-key lock", "description": "记录锁加间隙锁"},
+        ]
+
+        cases = rag_eval_service.build_session_eval_cases(
+            session,
+            documents,
+            knowledge_points,
+            limit=20,
+            include_template_cases=True,
+        )
+
+        self.assertGreaterEqual(len(cases), 2)
+        self.assertTrue(any(case.get("case_type") == "default" for case in cases))
+        self.assertTrue(any("MySQL 是怎么加锁的？" in (case.get("query") or "") for case in cases))
+        self.assertTrue(any("锁" in (case.get("query") or "") or "next-key" in (case.get("query") or "") for case in cases))
+
     def test_quiz_generation_grading_and_wrong_question_sink(self):
         session = {"session_name": "MySQL 锁", "topic": "锁机制", "goal": "理解原理"}
         knowledge_points = [

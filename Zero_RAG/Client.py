@@ -77,6 +77,10 @@ def reset_cached_views():
     st.session_state["agent_runs_session_id"] = None
     st.session_state["event_logs"] = None
     st.session_state["event_logs_session_id"] = None
+    st.session_state["rag_eval_data"] = None
+    st.session_state["rag_eval_session_id"] = None
+    st.session_state["rag_eval_cases"] = None
+    st.session_state["rag_eval_cases_session_id"] = None
 
 
 def refresh_sessions():
@@ -584,6 +588,42 @@ def load_agent_runs(limit: int = 20, run_type: str | None = None):
         st.error(extract_error_message(response))
 
 
+def load_rag_eval_cases(limit: int = 8):
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/rag/eval_cases",
+        params={"limit": limit},
+        timeout=30,
+    )
+    if response.ok:
+        payload = response.json()
+        st.session_state["rag_eval_cases"] = payload.get("cases", [])
+        st.session_state["rag_eval_cases_session_id"] = st.session_state["selected_session_id"]
+    else:
+        st.error(extract_error_message(response))
+
+
+def run_rag_evaluation(top_k: int = 5, threshold: float = 0.5):
+    payload = {
+        "user_id": st.session_state["user_id"],
+        "cases": st.session_state.get("rag_eval_cases") or [],
+        "top_k": int(top_k),
+        "low_quality_mrr_threshold": float(threshold),
+    }
+    response = requests.post(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/rag/evaluate",
+        json=payload,
+        timeout=180,
+    )
+    if response.ok:
+        st.session_state["rag_eval_data"] = response.json()
+        st.session_state["rag_eval_session_id"] = st.session_state["selected_session_id"]
+        load_agent_runs(limit=20, run_type="rag.evaluate")
+        load_recent_events(limit=20)
+        st.success("RAG 评测已完成。")
+    else:
+        st.error(extract_error_message(response))
+
+
 def start_interview_session(total_rounds: int, difficulty_label: str):
     payload = {
         "user_id": st.session_state["user_id"],
@@ -772,6 +812,18 @@ def get_current_agent_runs():
     return []
 
 
+def get_current_rag_eval_data():
+    if st.session_state.get("rag_eval_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("rag_eval_data")
+    return None
+
+
+def get_current_rag_eval_cases():
+    if st.session_state.get("rag_eval_cases_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("rag_eval_cases") or []
+    return []
+
+
 def render_quiz_answer_input(question: dict, quiz_set_id: int, index: int):
     question_type = question.get("question_type", "short_answer")
     base_key = f"quiz_answer_{quiz_set_id}_{index}"
@@ -890,6 +942,14 @@ if "event_logs" not in st.session_state:
     st.session_state["event_logs"] = None
 if "event_logs_session_id" not in st.session_state:
     st.session_state["event_logs_session_id"] = None
+if "rag_eval_data" not in st.session_state:
+    st.session_state["rag_eval_data"] = None
+if "rag_eval_session_id" not in st.session_state:
+    st.session_state["rag_eval_session_id"] = None
+if "rag_eval_cases" not in st.session_state:
+    st.session_state["rag_eval_cases"] = None
+if "rag_eval_cases_session_id" not in st.session_state:
+    st.session_state["rag_eval_cases_session_id"] = None
 if "plan_only_incomplete" not in st.session_state:
     st.session_state["plan_only_incomplete"] = False
 if "review_queue_limit" not in st.session_state:
@@ -1047,8 +1107,8 @@ with st.expander("会话概览", expanded=False):
         st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-chat_tab, eval_tab, interview_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, logs_tab = st.tabs(
-    ["学习问答", "回答评测", "模拟面试", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "运行观测"]
+chat_tab, eval_tab, interview_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, rag_eval_tab, logs_tab = st.tabs(
+    ["学习问答", "回答评测", "模拟面试", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "RAG评测", "运行观测"]
 )
 
 with chat_tab:
@@ -1548,6 +1608,73 @@ with report_tab:
                     st.write(f"- {item}")
         else:
             st.caption("点击上方按钮生成当前学习会话的复盘报告。")
+
+with rag_eval_tab:
+    st.subheader("RAG评测")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先新建会话或导入资料后再运行 RAG 评测。")
+    else:
+        rag_eval_col1, rag_eval_col2 = st.columns([1, 1])
+        with rag_eval_col1:
+            rag_eval_top_k = st.slider("评测 top-k", min_value=1, max_value=8, value=5)
+        with rag_eval_col2:
+            rag_eval_threshold = st.slider("低质量阈值(MRR)", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
+
+        rag_action_col1, rag_action_col2 = st.columns([1, 1])
+        with rag_action_col1:
+            if st.button("预览默认评测集", use_container_width=True):
+                load_rag_eval_cases(limit=8)
+        with rag_action_col2:
+            if st.button("运行RAG评测", use_container_width=True):
+                run_rag_evaluation(top_k=rag_eval_top_k, threshold=rag_eval_threshold)
+
+        rag_eval_cases = get_current_rag_eval_cases()
+        if rag_eval_cases:
+            st.markdown("**当前评测集**")
+            st.caption(f"已为当前会话准备 {len(rag_eval_cases)} 条评测样例。")
+            for index, case in enumerate(rag_eval_cases, start=1):
+                with st.expander(f"Case {index}: {case.get('query', '')}", expanded=False):
+                    st.caption(json.dumps(case, ensure_ascii=False))
+
+        rag_eval_data = get_current_rag_eval_data()
+        if rag_eval_data:
+            metrics = rag_eval_data.get("metrics", {})
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            with metric_col1:
+                st.metric("Case 数", rag_eval_data.get("case_count", 0))
+            with metric_col2:
+                st.metric("MRR", metrics.get("mrr", 0))
+            with metric_col3:
+                st.metric("Recall@1", (metrics.get("recall_at", {}) or {}).get("1", 0))
+            with metric_col4:
+                st.metric("Recall@5", (metrics.get("recall_at", {}) or {}).get("5", 0))
+
+            low_quality_cases = rag_eval_data.get("low_quality_cases", [])
+            st.markdown("**低质量 Query 分析**")
+            if low_quality_cases:
+                for item in low_quality_cases:
+                    with st.expander(f"{item.get('query', '')} | {item.get('reason', '')}", expanded=False):
+                        st.caption(
+                            f"rewritten={item.get('rewritten_query', '')} | "
+                            f"reciprocal_rank={item.get('reciprocal_rank', 0)}"
+                        )
+                        st.caption(json.dumps(item.get("top1", {}), ensure_ascii=False))
+            else:
+                st.caption("当前评测结果里没有低质量 query。")
+
+            st.markdown("**评测明细**")
+            for item in rag_eval_data.get("cases", []):
+                with st.expander(
+                    f"{item.get('query', '')} | rank={item.get('first_hit_rank')} | rr={item.get('reciprocal_rank', 0)}",
+                    expanded=False,
+                ):
+                    st.caption(
+                        f"rewritten={item.get('rewritten_query', '')} | "
+                        f"strategy={item.get('query_strategy', 'single_query')}"
+                    )
+                    render_retrieval_debug(item.get("retrieval_debug", {}))
+        else:
+            st.caption("先预览默认评测集，再运行 RAG 评测查看 Recall@k、MRR 和低质量 query。")
 
 with logs_tab:
     st.subheader("运行观测")

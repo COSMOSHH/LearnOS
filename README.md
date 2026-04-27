@@ -262,3 +262,29 @@ streamlit run Zero_RAG/Client.py
 1. `Multi-Query` 策略与扩展出的检索子问题
 2. `Parent-Child` 回填次数
 3. `Context Compression` 的去重、截断和最终上下文长度统计
+
+## RAG V1.3 更新
+
+当前已经完成 `RAG V1.3` 的第一版检索评测闭环，新增了：
+
+1. 默认评测集 `rag_eval_cases.json`
+2. 会话级自动评测集生成
+3. 检索评测接口：
+   - `GET /study_sessions/{session_id}/rag/eval_dataset_template`
+   - `GET /study_sessions/{session_id}/rag/eval_cases`
+   - `POST /study_sessions/{session_id}/rag/evaluate`
+4. 检索指标输出：
+   - `MRR`
+   - `Recall@1 / Recall@3 / Recall@5`
+   - `Top-k 命中情况`
+   - `low_quality_cases`
+5. 前端 `RAG评测` 标签页，可直接预览评测集、运行评测、查看低质量 query 和逐条检索调试信息
+
+现在 LearnOS 的 RAG 主链路可以概括为：
+
+1. `RAG V1.1`
+   Query Rewrite、标题增强分块、检索调试可视化
+2. `RAG V1.2`
+   Multi-Query、Parent-Child、Context Compression
+3. `RAG V1.3`
+   检索评测集、Recall@k / MRR、低质量 query 分析

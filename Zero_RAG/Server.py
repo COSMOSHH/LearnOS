@@ -55,7 +55,7 @@ from services.plan_service import (
     update_plan_item_completion,
 )
 from services.query_service import expand_query_to_multi_queries, rewrite_query
-from services.rag_eval_service import build_eval_dataset_template, evaluate_retrieval_cases
+from services.rag_eval_service import build_eval_dataset_template, build_session_eval_cases, evaluate_retrieval_cases
 from services.quiz_service import (
     create_quiz_set,
     generate_quiz_bundle,
@@ -126,7 +126,7 @@ class RetrievalEvalCase(BaseModel):
 
 class RetrievalEvalRequest(BaseModel):
     user_id: str = "default_user"
-    cases: list[RetrievalEvalCase]
+    cases: list[RetrievalEvalCase] = []
     top_k: int = 5
     low_quality_mrr_threshold: float = 0.5
 
@@ -946,12 +946,45 @@ async def get_rag_eval_dataset_template_endpoint(session_id: int):
     }
 
 
+@app.get("/study_sessions/{session_id}/rag/eval_cases")
+async def get_rag_eval_cases_endpoint(session_id: int, limit: int = Query(8)):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    documents = get_session_documents(session_id)
+    knowledge_points = get_session_knowledge_points(session_id)
+    cases = build_session_eval_cases(
+        session,
+        documents,
+        knowledge_points,
+        limit=limit,
+        include_template_cases=True,
+    )
+    return {"session_id": session_id, "case_count": len(cases), "cases": cases}
+
+
 @app.post("/study_sessions/{session_id}/rag/evaluate")
 async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEvalRequest):
     started = time.perf_counter()
     retriever, doc_chunks = _build_session_retriever(session_id)
     if not retriever or not doc_chunks:
         raise HTTPException(status_code=400, detail="No indexed study materials were found for this session.")
+
+    session = get_study_session(session_id)
+    documents = get_session_documents(session_id)
+    knowledge_points = get_session_knowledge_points(session_id)
+    eval_cases = [item.model_dump() for item in request.cases]
+    if not eval_cases:
+        eval_cases = build_session_eval_cases(
+            session,
+            documents,
+            knowledge_points,
+            limit=8,
+            include_template_cases=True,
+        )
+    if not eval_cases:
+        raise HTTPException(status_code=400, detail="No RAG evaluation cases are available for this session.")
 
     run_id = create_run(
         run_type="rag.evaluate",
@@ -965,7 +998,7 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
     try:
         payload = evaluate_retrieval_cases(
             retriever,
-            [item.model_dump() for item in request.cases],
+            eval_cases,
             rewrite_query=rewrite_query,
             expand_query_to_multi_queries=expand_query_to_multi_queries,
             session_context=_build_session_context_text(session_id),

@@ -367,6 +367,37 @@
 
 LearnOS 当前最缺的不是“换一个更大的向量库”，而是把查询优化、结构化分块、上下文治理和检索评测这四条链路补完整。
 
+## RAG V1.3 当前进度
+
+当前 `RAG V1.3` 第一版已经完成，落地内容包括：
+
+1. 默认检索评测集 `rag_eval_cases.json`
+2. 会话级自动评测集生成
+3. 后端评测服务 `services/rag_eval_service.py`
+4. 评测接口：
+   - `GET /study_sessions/{session_id}/rag/eval_dataset_template`
+   - `GET /study_sessions/{session_id}/rag/eval_cases`
+   - `POST /study_sessions/{session_id}/rag/evaluate`
+5. 指标输出：
+   - `MRR`
+   - `Recall@1 / Recall@3 / Recall@5`
+   - `Top-k 命中情况`
+   - `low_quality_cases`
+6. 前端 `RAG评测` 页签
+7. 服务层与接口层自动化测试覆盖
+
+这意味着 LearnOS 当前已经具备：
+
+1. 检索能力优化
+2. 检索过程可视化
+3. 检索效果可评测
+
+下一阶段建议从这里继续推进：
+
+1. 问题类型识别与检索路由
+2. 评测集分桶统计
+3. RAG 质量看板
+
 ## V1.2 当前进度
 
 `RAG V1.2` 已完成，当前落地情况如下：

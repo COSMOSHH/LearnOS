@@ -1,0 +1,38 @@
+[
+  {
+    "query": "什么是行锁，它主要解决什么问题？",
+    "relevant_titles": ["MySQL 锁", "MySQL 锁机制"],
+    "relevant_keywords": ["行锁", "索引记录", "并发冲突"],
+    "topic_keywords": ["mysql", "锁", "行锁"]
+  },
+  {
+    "query": "间隙锁为什么能防止幻读？",
+    "relevant_titles": ["MySQL 锁", "MySQL 锁机制"],
+    "relevant_keywords": ["间隙锁", "幻读", "索引区间"],
+    "topic_keywords": ["mysql", "锁", "间隙锁", "幻读"]
+  },
+  {
+    "query": "next-key lock 和行锁、间隙锁之间是什么关系？",
+    "relevant_titles": ["MySQL 锁", "MySQL 锁机制"],
+    "relevant_keywords": ["next-key lock", "行锁", "间隙锁"],
+    "topic_keywords": ["mysql", "锁", "next-key lock", "间隙锁"]
+  },
+  {
+    "query": "redo log 和 undo log 有什么区别？",
+    "relevant_titles": ["MySQL 日志", "MySQL 事务", "MySQL 锁机制"],
+    "relevant_keywords": ["redo log", "undo log", "WAL", "MVCC"],
+    "topic_keywords": ["mysql", "事务", "日志", "redo", "undo"]
+  },
+  {
+    "query": "redo log 为什么要先写日志再写数据页？",
+    "relevant_titles": ["MySQL 日志", "MySQL 事务", "MySQL 锁机制"],
+    "relevant_keywords": ["redo log", "WAL", "持久性", "崩溃恢复"],
+    "topic_keywords": ["mysql", "事务", "日志", "redo", "wal"]
+  },
+  {
+    "query": "undo log 和 MVCC 的关系是什么？",
+    "relevant_titles": ["MySQL 日志", "MySQL 事务", "MySQL 锁机制"],
+    "relevant_keywords": ["undo log", "MVCC", "回滚", "版本"],
+    "topic_keywords": ["mysql", "事务", "日志", "undo", "mvcc"]
+  }
+]

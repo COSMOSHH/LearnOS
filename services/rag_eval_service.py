@@ -1,5 +1,12 @@
+import json
 import re
+from pathlib import Path
 from typing import Any
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DATASET_PATH = ROOT_DIR / "rag_eval_cases.json"
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9_]+")
 
 
 def _normalize(text: str) -> str:
@@ -15,6 +22,88 @@ def _contains_any(haystack: str, needles: list[str]) -> bool:
         if token and token in normalized_haystack:
             return True
     return False
+
+
+def _tokenize(text: str) -> set[str]:
+    return {token.lower() for token in TOKEN_PATTERN.findall(text or "") if len(token.strip()) >= 2}
+
+
+def _build_session_keyword_text(session: dict, documents: list[dict], knowledge_points: list[dict]) -> str:
+    parts = [
+        session.get("session_name", ""),
+        session.get("topic", ""),
+        session.get("goal", ""),
+    ]
+    parts.extend(item.get("title", "") for item in documents)
+    parts.extend(item.get("file_name", "") for item in documents)
+    parts.extend(item.get("title", "") for item in knowledge_points)
+    return " ".join(part for part in parts if part)
+
+
+def load_default_eval_cases(path: Path | None = None) -> list[dict]:
+    dataset_path = path or DEFAULT_DATASET_PATH
+    if not dataset_path.exists():
+        return []
+    try:
+        payload = json.loads(dataset_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict) and item.get("query")]
+
+
+def build_eval_dataset_template(documents: list[dict]) -> list[dict]:
+    template = []
+    for doc in documents:
+        title = doc.get("title") or doc.get("file_name") or ""
+        if not title:
+            continue
+        source = doc.get("file_path") or doc.get("file_name") or title
+        template.append(
+            {
+                "query": f"请解释 {title} 的核心概念、关键机制和适用场景",
+                "relevant_titles": [title],
+                "relevant_sources": [source],
+                "relevant_keywords": [title],
+                "case_type": "template",
+            }
+        )
+    return template
+
+
+def build_session_eval_cases(
+    session: dict,
+    documents: list[dict],
+    knowledge_points: list[dict],
+    *,
+    limit: int = 8,
+    include_template_cases: bool = True,
+) -> list[dict]:
+    session_keywords = _tokenize(_build_session_keyword_text(session, documents, knowledge_points))
+    default_cases = load_default_eval_cases()
+    selected_cases = []
+
+    for case in default_cases:
+        topic_keywords = case.get("topic_keywords") or []
+        if not topic_keywords:
+            continue
+        if session_keywords & {token.lower() for token in topic_keywords}:
+            selected_cases.append({**case, "case_type": "default"})
+
+    if include_template_cases:
+        selected_cases.extend(build_eval_dataset_template(documents))
+
+    deduped = []
+    seen_queries = set()
+    for case in selected_cases:
+        query = (case.get("query") or "").strip()
+        if not query or query in seen_queries:
+            continue
+        seen_queries.add(query)
+        deduped.append(case)
+
+    return deduped[: max(1, int(limit or 8))]
 
 
 def _is_relevant(result: dict, case: dict) -> bool:
@@ -43,7 +132,6 @@ def _is_relevant(result: dict, case: dict) -> bool:
     if relevant_keywords and keyword_match:
         return True
 
-    # If the case only provides one dimension, respect that dimension.
     if relevant_sources and not (relevant_titles or relevant_keywords):
         return source_match
     if relevant_titles and not (relevant_sources or relevant_keywords):
@@ -86,16 +174,17 @@ def evaluate_retrieval_cases(
             session_context=session_context,
             llm_generator=llm_generator,
         )
+        rewritten_query = rewrite_payload.get("rewritten_query", query)
         expanded_payload = expand_query_to_multi_queries(
             original_query=query,
-            rewritten_query=rewrite_payload.get("rewritten_query", query),
+            rewritten_query=rewritten_query,
             session_context=session_context,
             llm_generator=llm_generator,
         )
 
         retrieved_results, retrieval_debug = retriever.retrieve_with_debug(
-            rewrite_payload.get("rewritten_query", query),
-            queries=expanded_payload.get("queries") or [rewrite_payload.get("rewritten_query", query)],
+            rewritten_query,
+            queries=expanded_payload.get("queries") or [rewritten_query],
         )
         sliced = retrieved_results[:top_k]
 
@@ -112,27 +201,29 @@ def evaluate_retrieval_cases(
             if first_hit_rank is not None and first_hit_rank <= k:
                 recall_hits[k] += 1
 
+        top_results = [
+            {
+                "rank": rank,
+                "score": item.get("score", 0.0),
+                "source": (item.get("metadata") or {}).get("source", ""),
+                "document_title": (item.get("metadata") or {}).get("document_title", ""),
+                "section_title": (item.get("metadata") or {}).get("section_title", ""),
+                "chunk_index": (item.get("metadata") or {}).get("chunk_index"),
+            }
+            for rank, item in enumerate(sliced, start=1)
+        ]
+
         per_case.append(
             {
                 "query": query,
-                "rewritten_query": rewrite_payload.get("rewritten_query", query),
+                "rewritten_query": rewritten_query,
                 "rewrite_reason": rewrite_payload.get("rewrite_reason", ""),
                 "query_strategy": expanded_payload.get("strategy", "single_query"),
                 "expanded_queries": expanded_payload.get("queries") or [query],
                 "first_hit_rank": first_hit_rank,
                 "reciprocal_rank": reciprocal_rank,
                 "hit_at": {f"{k}": bool(first_hit_rank is not None and first_hit_rank <= k) for k in k_values},
-                "top_results": [
-                    {
-                        "rank": rank,
-                        "score": item.get("score", 0.0),
-                        "source": (item.get("metadata") or {}).get("source", ""),
-                        "document_title": (item.get("metadata") or {}).get("document_title", ""),
-                        "section_title": (item.get("metadata") or {}).get("section_title", ""),
-                        "chunk_index": (item.get("metadata") or {}).get("chunk_index"),
-                    }
-                    for rank, item in enumerate(sliced, start=1)
-                ],
+                "top_results": top_results,
                 "retrieval_debug": retrieval_debug,
             }
         )
@@ -141,7 +232,12 @@ def evaluate_retrieval_cases(
     if case_count == 0:
         return {
             "case_count": 0,
-            "metrics": {"mrr": 0.0, "recall_at": {}},
+            "metrics": {
+                "mrr": 0.0,
+                "recall_at": {},
+                "top_k": top_k,
+                "low_quality_mrr_threshold": low_quality_mrr_threshold,
+            },
             "low_quality_cases": [],
             "cases": [],
         }
@@ -153,12 +249,20 @@ def evaluate_retrieval_cases(
     for case in per_case:
         rr = case["reciprocal_rank"]
         rank = case["first_hit_rank"]
-        if rr < low_quality_mrr_threshold:
+        reason = None
+        if rank is None:
+            reason = "no_hit"
+        elif rr < low_quality_mrr_threshold:
+            reason = f"late_hit_rank_{rank}"
+        elif case.get("top_results") and (case["top_results"][0].get("score", 0) or 0) < 0.3:
+            reason = "weak_top1_score"
+
+        if reason:
             low_quality_cases.append(
                 {
                     "query": case["query"],
                     "rewritten_query": case["rewritten_query"],
-                    "reason": "no_hit" if rank is None else f"late_hit_rank_{rank}",
+                    "reason": reason,
                     "reciprocal_rank": rr,
                     "top1": (case.get("top_results") or [{}])[0],
                 }
@@ -175,21 +279,3 @@ def evaluate_retrieval_cases(
         "low_quality_cases": low_quality_cases,
         "cases": per_case,
     }
-
-
-def build_eval_dataset_template(documents: list[dict]) -> list[dict]:
-    template = []
-    for doc in documents:
-        title = doc.get("title") or doc.get("file_name") or ""
-        if not title:
-            continue
-        source = doc.get("file_path") or doc.get("file_name") or title
-        template.append(
-            {
-                "query": f"请解释 {title} 的核心概念和适用场景",
-                "relevant_titles": [title],
-                "relevant_sources": [source],
-                "relevant_keywords": [title],
-            }
-        )
-    return template
