@@ -35,6 +35,11 @@
 26. 支持学习问答 Query Rewrite，提升口语化问题和追问场景下的检索稳定性。
 27. 支持标题增强分块，为网页与文档 chunk 补充章节标题和 heading path。
 28. 支持检索调试可视化，可查看原始 query、改写 query、向量召回、BM25 召回与 rerank 结果。
+29. 支持更细的语义分块，能够识别代码块、表格、列表和普通段落。
+30. 支持问题类型识别与检索路由，按事实、对比、原因、总结、面试、计划、测验类问题动态调整检索策略。
+31. 支持 Parent-Child 回填策略精细化，按命中 chunk 的邻近窗口回填父级上下文。
+32. 支持 RAG 评测分桶统计和低质量 query 样本沉淀。
+33. 支持 `RAG质量` 看板，查看 MRR、Recall@1、路由分布、低质原因和低质 query 样本库。
 
 ## 适合演示的亮点
 
@@ -59,12 +64,15 @@ LearnOS/
 │       ├── text_splitter.py     # 文本切块
 │       └── vector_store.py      # Chroma 封装
 ├── services/
+│   ├── context_service.py       # 生成前上下文压缩、去重与裁剪
 │   ├── document_service.py      # 文档、摘要、知识点存储
 │   ├── evaluation_service.py    # 回答质量评测
 │   ├── interview_service.py     # 模拟面试生成与逐轮作答
 │   ├── observability_service.py # 事件日志与 agent 运行观测
 │   ├── plan_service.py          # 学习计划生成与持久化
 │   ├── query_service.py         # 检索 query 改写
+│   ├── rag_eval_service.py      # RAG 评测集生成与检索评测
+│   ├── rag_quality_service.py   # RAG 质量看板与低质 query 样本
 │   ├── quiz_service.py          # 测验生成、评分、持久化
 │   ├── report_service.py        # 学习报告生成
 │   ├── review_service.py        # 复习调度、错题重练与复习上下文
@@ -185,6 +193,8 @@ streamlit run Zero_RAG/Client.py
    `学习计划`
    `学习报告`
    `运行观测`
+   `RAG评测`
+   `RAG质量`
 8. 支持删除当前会话。
 9. 测验模式支持单选题、填空题、简答题混合出题，并按题型渲染输入。
 10. 测验低分题会自动沉淀为高优先级复习项。
@@ -225,6 +235,10 @@ streamlit run Zero_RAG/Client.py
 22. 模拟面试模式。
 23. Agent run / step 级运行观测。
 24. Query Rewrite、标题增强分块与检索调试可视化。
+25. RAG V1.2 的 Multi-Query、Parent-Child、Context Compression。
+26. RAG V1.2 后续优化：语义分块、Parent 回填策略精细化、检索路由 debug。
+27. RAG V1.3 第一版检索评测闭环。
+28. RAG V2 第一版问题类型识别、检索路由、低质 query 样本库和 RAG 质量看板。
 
 ### 部分完成
 
@@ -242,9 +256,13 @@ streamlit run Zero_RAG/Client.py
 
 1. [阶段性完成报告.md](阶段性完成报告.md)
 2. [产品功能清单与优先级.md](产品功能清单与优先级.md)
-3. [第一阶段实施任务拆解.md](第一阶段实施任务拆解.md)
-4. [数据库表结构设计.md](数据库表结构设计.md)
-5. [学习辅助Agent项目改造计划.md](学习辅助Agent项目改造计划.md)
+3. [LearnOS RAG产品功能清单与优先级.md](LearnOS%20RAG产品功能清单与优先级.md)
+4. [LearnOS RAG优化路线图.md](LearnOS%20RAG优化路线图.md)
+5. [数据库表结构设计.md](数据库表结构设计.md)
+6. [项目面试预测问答.md](项目面试预测问答.md)
+7. [项目面试高频追问速记版.md](项目面试高频追问速记版.md)
+8. [项目拷打式深挖问答版.md](项目拷打式深挖问答版.md)
+9. [多Agent架构图.md](多Agent架构图.md)
 
 ## RAG V1.2 更新
 
@@ -288,3 +306,20 @@ streamlit run Zero_RAG/Client.py
    Multi-Query、Parent-Child、Context Compression
 3. `RAG V1.3`
    检索评测集、Recall@k / MRR、低质量 query 分析
+4. `RAG V2`
+   问题类型识别、动态检索路由、低质 query 样本沉淀、RAG 质量看板
+
+## RAG V1.2 后续优化与 RAG V2 更新
+
+本轮继续补齐了 `V1.2 后续优化` 和 `RAG V2` 第一版：
+
+1. `更完整语义分块`
+   `SemanticTextSplitter` 现在会保留代码块、表格、列表、普通段落等语义单元，再进入长度切分。
+2. `Parent 回填策略精细化`
+   Parent-Child 不再简单整章截断，而是围绕命中 child chunk 取邻近窗口，并输出 `parent_debug`。
+3. `问题类型识别与检索路由`
+   新增事实、对比、原因、总结、面试、计划、测验等类型识别，动态调整 Multi-Query、top-k、Parent 窗口和上下文预算。
+4. `低质量 query 样本沉淀`
+   `rag_quality_samples` 会保存评测中的 no_hit、late_hit、weak_top1 等低质量样本。
+5. `RAG质量看板`
+   新增接口 `GET /study_sessions/{session_id}/rag/quality` 和前端 `RAG质量` 页签，可查看质量摘要、路由分布、低质原因分布和样本库。

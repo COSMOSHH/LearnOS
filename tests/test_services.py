@@ -15,6 +15,7 @@ from services import (
     plan_service,
     query_service,
     rag_eval_service,
+    rag_quality_service,
     quiz_service,
     report_service,
     review_service,
@@ -53,6 +54,7 @@ class ServiceTests(unittest.TestCase):
         observability_service.DB_PATH = self.study_db
         plan_service.DB_PATH = self.study_db
         quiz_service.DB_PATH = self.study_db
+        rag_quality_service.DB_PATH = self.study_db
         review_service.DB_PATH = self.study_db
         study_session_service.DB_PATH = self.study_db
         chat_history_service.DB_FILE = self.chat_db
@@ -137,6 +139,15 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(expanded["queries"]), 2)
 
+        route = query_service.plan_retrieval_route(
+            "redo log 和 undo log 有什么区别？",
+            rewritten_query="redo log 和 undo log 的区别和关系",
+            session_context="MySQL 事务与日志",
+        )
+        self.assertEqual(route["classification"]["question_type"], "compare")
+        self.assertTrue(route["route_strategy"]["use_multi_query"])
+        self.assertGreater(route["route_strategy"]["vector_top_k"], 5)
+
         splitter = SemanticTextSplitter(chunk_size=80, chunk_overlap=10)
         chunks = splitter.split_text_with_metadata(
             "# MySQL 锁\n## 行锁\n行锁用于锁住索引记录。\n## 间隙锁\n间隙锁用于防止幻读。",
@@ -144,6 +155,13 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(chunks), 2)
         self.assertTrue(any("行锁" in item["heading_path"] for item in chunks))
+
+        semantic_chunks = splitter.split_text_with_metadata(
+            "# 示例\n普通说明段落。\n\n```python\nprint('hi')\n```\n\n- 步骤一\n- 步骤二",
+            document_title="示例",
+        )
+        self.assertTrue(any(item["chunk_type"] == "code_block" for item in semantic_chunks))
+        self.assertTrue(any(item["chunk_type"] == "list" for item in semantic_chunks))
 
     def test_context_compression_dedupes_and_truncates(self):
         results, debug_payload = context_service.build_generation_context(
@@ -175,7 +193,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_rag_eval_metrics_and_low_quality_cases(self):
         class FakeRetriever:
-            def retrieve_with_debug(self, query, queries=None):
+            def retrieve_with_debug(self, query, queries=None, **kwargs):
                 if "行锁" in query:
                     return (
                         [
@@ -239,6 +257,56 @@ class ServiceTests(unittest.TestCase):
         self.assertAlmostEqual(payload["metrics"]["recall_at"]["3"], 0.5)
         self.assertAlmostEqual(payload["metrics"]["mrr"], 0.5)
         self.assertGreaterEqual(len(payload["low_quality_cases"]), 1)
+
+    def test_rag_quality_samples_and_dashboard(self):
+        session = study_session_service.create_study_session("u1", "RAG质量测试", topic="MySQL 锁", goal="诊断检索质量")
+        run_id = observability_service.create_run(
+            run_type="rag.evaluate",
+            session_id=session["id"],
+            user_id="u1",
+            title="RAG 检索评测",
+            metadata={"mrr": 0.4, "recall_at": {"1": 0.5}, "low_quality_count": 1},
+        )
+        observability_service.finish_run(
+            run_id,
+            status="success",
+            metadata={"mrr": 0.4, "recall_at": {"1": 0.5}, "low_quality_count": 1},
+        )
+        chat_run_id = observability_service.create_run(
+            run_type="study_chat",
+            session_id=session["id"],
+            user_id="u1",
+            title="学习问答",
+            metadata={
+                "question_type": "compare",
+                "route_strategy": {"strategy_name": "compare_multi_query"},
+            },
+        )
+        observability_service.finish_run(chat_run_id, status="success")
+
+        saved_count = rag_quality_service.save_low_quality_samples(
+            session_id=session["id"],
+            user_id="u1",
+            low_quality_cases=[
+                {
+                    "query": "redo log 和 undo log 有什么区别",
+                    "rewritten_query": "redo log 和 undo log 的区别",
+                    "question_type": "compare",
+                    "reason": "no_hit",
+                    "reciprocal_rank": 0,
+                    "top1": {"document_title": "无关文档"},
+                }
+            ],
+            metrics={"mrr": 0.4},
+            source_run_id=run_id,
+        )
+        self.assertEqual(saved_count, 1)
+
+        dashboard = rag_quality_service.build_rag_quality_dashboard(session["id"])
+        self.assertEqual(dashboard["summary"]["eval_run_count"], 1)
+        self.assertEqual(dashboard["summary"]["low_quality_sample_count"], 1)
+        self.assertEqual(dashboard["distributions"]["route_strategy"]["compare_multi_query"], 1)
+        self.assertEqual(dashboard["distributions"]["low_quality_reason"]["no_hit"], 1)
 
     def test_build_session_eval_cases_matches_topic_keywords(self):
         session = {

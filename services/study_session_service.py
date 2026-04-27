@@ -107,6 +107,7 @@ def delete_study_session(session_id: int, user_id: str) -> bool:
         (session_id,),
     )
     cursor.execute("DELETE FROM agent_runs WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM rag_quality_samples WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM event_logs WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM review_items WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM knowledge_points WHERE session_id = ?", (session_id,))

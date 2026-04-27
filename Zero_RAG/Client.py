@@ -81,6 +81,8 @@ def reset_cached_views():
     st.session_state["rag_eval_session_id"] = None
     st.session_state["rag_eval_cases"] = None
     st.session_state["rag_eval_cases_session_id"] = None
+    st.session_state["rag_quality_data"] = None
+    st.session_state["rag_quality_session_id"] = None
 
 
 def refresh_sessions():
@@ -619,7 +621,21 @@ def run_rag_evaluation(top_k: int = 5, threshold: float = 0.5):
         st.session_state["rag_eval_session_id"] = st.session_state["selected_session_id"]
         load_agent_runs(limit=20, run_type="rag.evaluate")
         load_recent_events(limit=20)
+        load_rag_quality_dashboard(limit=50)
         st.success("RAG 评测已完成。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def load_rag_quality_dashboard(limit: int = 50):
+    response = requests.get(
+        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/rag/quality",
+        params={"limit": limit},
+        timeout=30,
+    )
+    if response.ok:
+        st.session_state["rag_quality_data"] = response.json()
+        st.session_state["rag_quality_session_id"] = st.session_state["selected_session_id"]
     else:
         st.error(extract_error_message(response))
 
@@ -704,6 +720,13 @@ def render_retrieval_debug(retrieval_debug: dict | None):
             f"\n改写问题：{retrieval_debug.get('rewritten_query', '')}\n"
             f"\n改写原因：{retrieval_debug.get('rewrite_reason', '')}"
         )
+        route_strategy = retrieval_debug.get("route_strategy") or {}
+        if retrieval_debug.get("question_type") or route_strategy:
+            st.caption(
+                f"问题类型：{retrieval_debug.get('question_type', 'unknown')} | "
+                f"路由：{route_strategy.get('strategy_name', 'default')} | "
+                f"top-k={route_strategy.get('final_top_k', retrieval_debug.get('final_top_k', ''))}"
+            )
 
         expanded_queries = retrieval_debug.get("expanded_queries", [])
         if expanded_queries:
@@ -752,6 +775,15 @@ def render_retrieval_debug(retrieval_debug: dict | None):
         parent_enriched = retrieval_debug.get("parent_enriched", 0)
         if parent_enriched:
             st.caption(f"Parent-Child 回填次数: {parent_enriched}")
+        parent_debug = retrieval_debug.get("parent_debug") or []
+        if parent_debug:
+            st.markdown("**Parent 回填细节**")
+            for item in parent_debug[:5]:
+                st.caption(
+                    f"{item.get('heading_path', '')} | hit={item.get('hit_chunk_index')} | "
+                    f"window={item.get('window_start')}-{item.get('window_end')} | "
+                    f"chars={item.get('parent_chars')} | truncated={item.get('truncated')}"
+                )
 
 
 def get_current_quiz_bundle():
@@ -822,6 +854,12 @@ def get_current_rag_eval_cases():
     if st.session_state.get("rag_eval_cases_session_id") == st.session_state.get("selected_session_id"):
         return st.session_state.get("rag_eval_cases") or []
     return []
+
+
+def get_current_rag_quality_data():
+    if st.session_state.get("rag_quality_session_id") == st.session_state.get("selected_session_id"):
+        return st.session_state.get("rag_quality_data")
+    return None
 
 
 def render_quiz_answer_input(question: dict, quiz_set_id: int, index: int):
@@ -950,6 +988,10 @@ if "rag_eval_cases" not in st.session_state:
     st.session_state["rag_eval_cases"] = None
 if "rag_eval_cases_session_id" not in st.session_state:
     st.session_state["rag_eval_cases_session_id"] = None
+if "rag_quality_data" not in st.session_state:
+    st.session_state["rag_quality_data"] = None
+if "rag_quality_session_id" not in st.session_state:
+    st.session_state["rag_quality_session_id"] = None
 if "plan_only_incomplete" not in st.session_state:
     st.session_state["plan_only_incomplete"] = False
 if "review_queue_limit" not in st.session_state:
@@ -1107,8 +1149,8 @@ with st.expander("会话概览", expanded=False):
         st.info("请先新建空白会话，或者导入资料开始学习。")
 
 
-chat_tab, eval_tab, interview_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, rag_eval_tab, logs_tab = st.tabs(
-    ["学习问答", "回答评测", "模拟面试", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "RAG评测", "运行观测"]
+chat_tab, eval_tab, interview_tab, quiz_tab, wrong_tab, review_tab, plan_tab, report_tab, rag_eval_tab, rag_quality_tab, logs_tab = st.tabs(
+    ["学习问答", "回答评测", "模拟面试", "测验模式", "错题本", "复习调度", "学习计划", "学习报告", "RAG评测", "RAG质量", "运行观测"]
 )
 
 with chat_tab:
@@ -1650,6 +1692,11 @@ with rag_eval_tab:
                 st.metric("Recall@5", (metrics.get("recall_at", {}) or {}).get("5", 0))
 
             low_quality_cases = rag_eval_data.get("low_quality_cases", [])
+            buckets = metrics.get("buckets") or {}
+            if buckets:
+                st.markdown("**问题类型分桶指标**")
+                st.json(buckets)
+
             st.markdown("**低质量 Query 分析**")
             if low_quality_cases:
                 for item in low_quality_cases:
@@ -1675,6 +1722,73 @@ with rag_eval_tab:
                     render_retrieval_debug(item.get("retrieval_debug", {}))
         else:
             st.caption("先预览默认评测集，再运行 RAG 评测查看 Recall@k、MRR 和低质量 query。")
+
+with rag_quality_tab:
+    st.subheader("RAG质量")
+    if st.session_state["selected_session_id"] is None:
+        st.info("先选择学习会话后再查看 RAG 质量。")
+    else:
+        if st.button("刷新RAG质量看板", use_container_width=True):
+            load_rag_quality_dashboard(limit=50)
+
+        quality_data = get_current_rag_quality_data()
+        if quality_data:
+            summary = quality_data.get("summary", {})
+            q_col1, q_col2, q_col3, q_col4 = st.columns(4)
+            with q_col1:
+                st.metric("评测次数", summary.get("eval_run_count", 0))
+            with q_col2:
+                st.metric("平均MRR", summary.get("avg_mrr", 0))
+            with q_col3:
+                st.metric("平均Recall@1", summary.get("avg_recall_at_1", 0))
+            with q_col4:
+                st.metric("低质样本", summary.get("low_quality_sample_count", 0))
+
+            distributions = quality_data.get("distributions", {})
+            dist_left, dist_right = st.columns([1, 1])
+            with dist_left:
+                st.markdown("**问题类型分布**")
+                question_type_dist = distributions.get("question_type") or distributions.get("low_quality_question_type") or {}
+                if question_type_dist:
+                    st.bar_chart(question_type_dist)
+                else:
+                    st.caption("暂无问题类型数据。")
+            with dist_right:
+                st.markdown("**路由策略分布**")
+                route_dist = distributions.get("route_strategy") or {}
+                if route_dist:
+                    st.bar_chart(route_dist)
+                else:
+                    st.caption("暂无路由策略数据。")
+
+            reason_dist = distributions.get("low_quality_reason") or {}
+            if reason_dist:
+                st.markdown("**低质原因分布**")
+                st.bar_chart(reason_dist)
+
+            low_quality_samples = quality_data.get("low_quality_samples", [])
+            st.markdown("**低质 Query 样本库**")
+            if low_quality_samples:
+                for item in low_quality_samples:
+                    with st.expander(f"{item.get('query_text', '')} | {item.get('reason', '')}", expanded=False):
+                        st.caption(
+                            f"type={item.get('question_type', 'unknown')} | "
+                            f"rr={item.get('reciprocal_rank', 0)} | "
+                            f"created={item.get('created_at', '')}"
+                        )
+                        if item.get("rewritten_query"):
+                            st.write(item.get("rewritten_query"))
+                        if item.get("top1"):
+                            st.caption(json.dumps(item.get("top1", {}), ensure_ascii=False))
+            else:
+                st.caption("暂无沉淀的低质 query。")
+
+            trend = quality_data.get("low_quality_trend", [])
+            if trend:
+                st.markdown("**近期评测趋势**")
+                st.json(trend)
+        else:
+            st.caption("点击上方按钮加载当前会话的 RAG 质量看板。")
 
 with logs_tab:
     st.subheader("运行观测")

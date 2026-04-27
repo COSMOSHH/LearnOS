@@ -33,6 +33,7 @@ from services import (
     observability_service,
     plan_service,
     quiz_service,
+    rag_quality_service,
     review_service,
     study_session_service,
 )
@@ -57,6 +58,7 @@ class ApiTests(unittest.TestCase):
         observability_service.DB_PATH = self.study_db
         plan_service.DB_PATH = self.study_db
         quiz_service.DB_PATH = self.study_db
+        rag_quality_service.DB_PATH = self.study_db
         review_service.DB_PATH = self.study_db
         study_session_service.DB_PATH = self.study_db
         chat_history_service.DB_FILE = self.chat_db
@@ -404,7 +406,7 @@ class ApiTests(unittest.TestCase):
         self.assertGreaterEqual(auto_cases_resp.json()["case_count"], 1)
 
         class FakeRetriever:
-            def retrieve_with_debug(self, query, queries=None):
+            def retrieve_with_debug(self, query, queries=None, **kwargs):
                 return (
                     [
                         {
@@ -434,6 +436,12 @@ class ApiTests(unittest.TestCase):
                             "relevant_sources": ["docs/lock.md"],
                             "relevant_titles": ["MySQL 锁"],
                             "relevant_keywords": ["行锁"],
+                        },
+                        {
+                            "query": "什么是哈希索引",
+                            "relevant_sources": ["docs/hash.md"],
+                            "relevant_titles": ["哈希索引"],
+                            "relevant_keywords": ["哈希索引"],
                         }
                     ],
                 },
@@ -441,8 +449,15 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(eval_resp.status_code, 200)
         payload = eval_resp.json()
-        self.assertEqual(payload["case_count"], 1)
-        self.assertGreaterEqual(payload["metrics"]["mrr"], 1.0)
+        self.assertEqual(payload["case_count"], 2)
+        self.assertGreaterEqual(payload["metrics"]["mrr"], 0.5)
+        self.assertGreaterEqual(len(payload["low_quality_cases"]), 1)
+
+        quality_resp = self.client.get(f"/study_sessions/{session['id']}/rag/quality")
+        self.assertEqual(quality_resp.status_code, 200)
+        quality_payload = quality_resp.json()
+        self.assertGreaterEqual(quality_payload["summary"]["low_quality_sample_count"], 1)
+        self.assertTrue(quality_payload["low_quality_samples"])
 
 
 if __name__ == "__main__":

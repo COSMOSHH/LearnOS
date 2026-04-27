@@ -148,6 +148,7 @@ def evaluate_retrieval_cases(
     *,
     rewrite_query,
     expand_query_to_multi_queries,
+    plan_retrieval_route=None,
     session_context: str,
     llm_generator=None,
     top_k: int = 5,
@@ -175,16 +176,47 @@ def evaluate_retrieval_cases(
             llm_generator=llm_generator,
         )
         rewritten_query = rewrite_payload.get("rewritten_query", query)
-        expanded_payload = expand_query_to_multi_queries(
-            original_query=query,
-            rewritten_query=rewritten_query,
-            session_context=session_context,
-            llm_generator=llm_generator,
-        )
+        if plan_retrieval_route:
+            route_payload = plan_retrieval_route(
+                query,
+                rewritten_query=rewritten_query,
+                session_context=session_context,
+                mode="eval",
+            )
+        else:
+            route_payload = {
+                "classification": {"question_type": "unknown", "confidence": 0.0, "signals": []},
+                "route_strategy": {},
+            }
+        route_strategy = route_payload.get("route_strategy") or {}
+        classification = route_payload.get("classification") or {}
+
+        if route_strategy.get("use_multi_query", True):
+            expanded_payload = expand_query_to_multi_queries(
+                original_query=query,
+                rewritten_query=rewritten_query,
+                session_context=session_context,
+                llm_generator=llm_generator,
+            )
+        else:
+            expanded_payload = {"strategy": "routed_single_query", "queries": [rewritten_query or query]}
 
         retrieved_results, retrieval_debug = retriever.retrieve_with_debug(
             rewritten_query,
             queries=expanded_payload.get("queries") or [rewritten_query],
+            vector_top_k=route_strategy.get("vector_top_k"),
+            bm25_top_k=route_strategy.get("bm25_top_k"),
+            final_top_k=max(top_k, int(route_strategy.get("final_top_k") or top_k)),
+            parent_window=route_strategy.get("parent_window"),
+            parent_max_chars=route_strategy.get("parent_max_chars"),
+        )
+        retrieval_debug.update(
+            {
+                "question_type": classification.get("question_type", "unknown"),
+                "question_type_confidence": classification.get("confidence", 0.0),
+                "question_type_signals": classification.get("signals", []),
+                "route_strategy": route_strategy,
+            }
         )
         sliced = retrieved_results[:top_k]
 
@@ -218,6 +250,8 @@ def evaluate_retrieval_cases(
                 "query": query,
                 "rewritten_query": rewritten_query,
                 "rewrite_reason": rewrite_payload.get("rewrite_reason", ""),
+                "question_type": classification.get("question_type", "unknown"),
+                "route_strategy": route_strategy,
                 "query_strategy": expanded_payload.get("strategy", "single_query"),
                 "expanded_queries": expanded_payload.get("queries") or [query],
                 "first_hit_rank": first_hit_rank,
@@ -235,6 +269,7 @@ def evaluate_retrieval_cases(
             "metrics": {
                 "mrr": 0.0,
                 "recall_at": {},
+                "buckets": {},
                 "top_k": top_k,
                 "low_quality_mrr_threshold": low_quality_mrr_threshold,
             },
@@ -244,6 +279,18 @@ def evaluate_retrieval_cases(
 
     recall_at = {f"{k}": round(recall_hits[k] / case_count, 4) for k in k_values}
     mrr = round(reciprocal_rank_sum / case_count, 4)
+    buckets: dict[str, dict[str, Any]] = {}
+    for case in per_case:
+        question_type = case.get("question_type") or "unknown"
+        bucket = buckets.setdefault(question_type, {"case_count": 0, "reciprocal_rank_sum": 0.0, "recall_at_1_hits": 0})
+        bucket["case_count"] += 1
+        bucket["reciprocal_rank_sum"] += case["reciprocal_rank"]
+        if case["first_hit_rank"] is not None and case["first_hit_rank"] <= 1:
+            bucket["recall_at_1_hits"] += 1
+    for bucket in buckets.values():
+        count = max(1, bucket["case_count"])
+        bucket["mrr"] = round(bucket.pop("reciprocal_rank_sum") / count, 4)
+        bucket["recall_at_1"] = round(bucket.pop("recall_at_1_hits") / count, 4)
 
     low_quality_cases = []
     for case in per_case:
@@ -262,6 +309,8 @@ def evaluate_retrieval_cases(
                 {
                     "query": case["query"],
                     "rewritten_query": case["rewritten_query"],
+                    "question_type": case.get("question_type", "unknown"),
+                    "route_strategy": case.get("route_strategy", {}),
                     "reason": reason,
                     "reciprocal_rank": rr,
                     "top1": (case.get("top_results") or [{}])[0],
@@ -273,6 +322,7 @@ def evaluate_retrieval_cases(
         "metrics": {
             "mrr": mrr,
             "recall_at": recall_at,
+            "buckets": buckets,
             "top_k": top_k,
             "low_quality_mrr_threshold": low_quality_mrr_threshold,
         },
