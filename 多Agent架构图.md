@@ -6,6 +6,8 @@
 
 目标不是把 Agent 做得很多，而是把分工、编排和扩展路线讲清楚。
 
+> 当前说明：这份文档更适合作为“多 Agent 设计草图和演进方向”。当前对外稳定主链路仍然是 `/chat` + service 层编排，`agent_engine` 与 `/agent_chat` 属于预留/实验能力，不应直接表述成默认主流程。
+
 ## 2. 架构目标
 
 ### 2.1 为什么使用多 Agent
@@ -31,11 +33,11 @@
 
 | Agent | 职责 | 当前状态 |
 | --- | --- | --- |
-| `primary_assistant` | 总控、意图识别、任务分发、最终回答 | 第一阶段必做 |
-| `learning_ingest_assistant` | 文档整理、摘要、知识点抽取 | 第一阶段必做 |
-| `review_assistant` | 历史知识召回、复习提醒、复习项生成 | 第一阶段必做 |
-| `quiz_assistant` | 出题、自测、错题反馈 | 第一阶段建议接入 |
-| `planner_assistant` | 学习计划和优先级调整 | 第一阶段建议接入 |
+| `primary_assistant` | 总控、意图识别、任务分发、最终回答 | 已有骨架，非当前主链路 |
+| `learning_ingest_assistant` | 文档整理、摘要、知识点抽取 | 已有工具与模型定义，非当前主链路 |
+| `review_assistant` | 历史知识召回、复习提醒、复习项生成 | 已有工具与模型定义，非当前主链路 |
+| `quiz_assistant` | 出题、自测、错题反馈 | 已有工具与模型定义，非当前主链路 |
+| `planner_assistant` | 学习计划和优先级调整 | 已有工具与模型定义，非当前主链路 |
 
 ## 4. 高层架构图
 
@@ -262,12 +264,11 @@ sequenceDiagram
 6. `tools/quiz_tools.py`
 7. `tools/planner_tools.py`
 
-### 9.2 后续建议新增
+### 9.2 当前更准确的代码现实
 
-1. `services/review_service.py`
-2. `services/session_service.py`
-3. `services/document_service.py`
-4. `services/run_trace_service.py`
+1. `services/review_service.py`、`services/document_service.py`、`services/plan_service.py`、`services/quiz_service.py` 已经落地。
+2. 学习问答、面试、评测、RAG 评测与质量看板当前主要由 service 层和 `/chat` 主链路驱动。
+3. `agent_engine.py` 与 `/agent_chat` 仍然保留，适合作为后续多 Agent 编排演进入口。
 
 ## 10. 第二阶段可扩展方向
 

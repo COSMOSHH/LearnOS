@@ -26,9 +26,9 @@ class SemanticTextSplitter:
             content = (section.get("content") or "").strip()
             if not content:
                 continue
-            section_chunks = self._split_text_with_separators(content, self.separators)
-            for chunk in section_chunks:
-                normalized_chunk = chunk.strip()
+            section_chunks = self._split_section_semantically(content)
+            for chunk_record in section_chunks:
+                normalized_chunk = chunk_record["text"].strip()
                 if not normalized_chunk:
                     continue
                 chunk_records.append(
@@ -36,7 +36,7 @@ class SemanticTextSplitter:
                         "text": normalized_chunk,
                         "section_title": section.get("section_title") or document_title or "正文",
                         "heading_path": section.get("heading_path") or document_title or "正文",
-                        "chunk_type": section.get("chunk_type", "section"),
+                        "chunk_type": chunk_record.get("chunk_type") or section.get("chunk_type", "section"),
                     }
                 )
 
@@ -125,6 +125,103 @@ class SemanticTextSplitter:
             chunks.append("".join(current_chunk).strip())
 
         return chunks
+
+    def _split_section_semantically(self, text: str) -> list[dict]:
+        blocks = self._extract_semantic_blocks(text)
+        if not blocks:
+            return [{"text": chunk, "chunk_type": "section"} for chunk in self._split_text_with_separators(text, self.separators)]
+
+        chunks: list[dict] = []
+        current_texts: list[str] = []
+        current_types: set[str] = set()
+        current_length = 0
+
+        def flush_current():
+            nonlocal current_texts, current_types, current_length
+            if not current_texts:
+                return
+            chunk_type = next(iter(current_types)) if len(current_types) == 1 else "mixed"
+            chunks.append({"text": "\n\n".join(current_texts).strip(), "chunk_type": chunk_type})
+            current_texts = []
+            current_types = set()
+            current_length = 0
+
+        for block in blocks:
+            block_text = block["text"].strip()
+            block_type = block.get("chunk_type", "paragraph")
+            if not block_text:
+                continue
+
+            if len(block_text) > self.chunk_size:
+                flush_current()
+                for sub_chunk in self._split_text_with_separators(block_text, self.separators):
+                    if sub_chunk.strip():
+                        chunks.append({"text": sub_chunk.strip(), "chunk_type": block_type})
+                continue
+
+            separator_cost = 2 if current_texts else 0
+            type_switch = current_types and block_type not in current_types and ("code_block" in current_types or block_type == "code_block")
+            if (current_length + separator_cost + len(block_text) > self.chunk_size or type_switch) and current_texts:
+                flush_current()
+
+            current_texts.append(block_text)
+            current_types.add(block_type)
+            current_length += separator_cost + len(block_text)
+
+        flush_current()
+        return chunks
+
+    def _extract_semantic_blocks(self, text: str) -> list[dict]:
+        blocks: list[dict] = []
+        current_lines: list[str] = []
+        current_type = "paragraph"
+        in_code_block = False
+
+        def flush_current():
+            nonlocal current_lines, current_type
+            content = "\n".join(current_lines).strip()
+            if content:
+                blocks.append({"text": content, "chunk_type": current_type})
+            current_lines = []
+            current_type = "paragraph"
+
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+
+            if stripped.startswith("```"):
+                if not in_code_block:
+                    flush_current()
+                    current_type = "code_block"
+                    in_code_block = True
+                current_lines.append(raw_line)
+                if in_code_block and len(current_lines) > 1:
+                    flush_current()
+                    in_code_block = False
+                continue
+
+            if in_code_block:
+                current_lines.append(raw_line)
+                continue
+
+            if not stripped:
+                flush_current()
+                continue
+
+            line_type = self._classify_semantic_line(stripped)
+            if current_lines and line_type != current_type:
+                flush_current()
+            current_type = line_type
+            current_lines.append(raw_line)
+
+        flush_current()
+        return blocks
+
+    def _classify_semantic_line(self, stripped_line: str) -> str:
+        if stripped_line.startswith("|") and stripped_line.endswith("|"):
+            return "table"
+        if re.match(r"^([-*+]|\d+[.)])\s+", stripped_line):
+            return "list"
+        return "paragraph"
 
     def _extract_sections_from_text(self, text: str, document_title: str = "") -> list[dict]:
         lines = text.splitlines()

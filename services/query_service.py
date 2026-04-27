@@ -6,6 +6,102 @@ PRONOUN_TOKENS = ("这个", "这个东西", "这个问题", "它", "它们", "�
 COMPARE_TOKENS = ("区别", "不同", "对比", "比较", "联系", "关系")
 WHY_TOKENS = ("为什么", "原因", "为啥")
 SUMMARY_TOKENS = ("总结", "概括", "梳理", "介绍", "说说", "展开讲讲")
+INTERVIEW_TOKENS = ("面试", "追问", "考察", "八股", "回答要点", "高频问题")
+PLAN_TOKENS = ("学习计划", "怎么学", "先学", "下一步", "复习顺序", "安排")
+QUIZ_TOKENS = ("出题", "测验", "自测", "练习题", "选择题", "填空题", "简答题")
+DEFINITION_TOKENS = ("是什么", "定义", "概念", "作用", "怎么理解")
+
+
+ROUTE_PROFILES = {
+    "fact": {
+        "strategy_name": "focused_single_query",
+        "use_multi_query": False,
+        "vector_top_k": 5,
+        "bm25_top_k": 5,
+        "final_top_k": 3,
+        "parent_window": 1,
+        "parent_max_chars": 900,
+        "max_context_chars": 1800,
+        "per_chunk_max_chars": 420,
+    },
+    "compare": {
+        "strategy_name": "compare_multi_query",
+        "use_multi_query": True,
+        "vector_top_k": 7,
+        "bm25_top_k": 7,
+        "final_top_k": 4,
+        "parent_window": 1,
+        "parent_max_chars": 1100,
+        "max_context_chars": 2400,
+        "per_chunk_max_chars": 500,
+    },
+    "why": {
+        "strategy_name": "mechanism_multi_query",
+        "use_multi_query": True,
+        "vector_top_k": 7,
+        "bm25_top_k": 6,
+        "final_top_k": 4,
+        "parent_window": 2,
+        "parent_max_chars": 1300,
+        "max_context_chars": 2600,
+        "per_chunk_max_chars": 520,
+    },
+    "summary": {
+        "strategy_name": "summary_parent_context",
+        "use_multi_query": True,
+        "vector_top_k": 8,
+        "bm25_top_k": 6,
+        "final_top_k": 5,
+        "parent_window": 2,
+        "parent_max_chars": 1500,
+        "max_context_chars": 3000,
+        "per_chunk_max_chars": 560,
+    },
+    "interview": {
+        "strategy_name": "interview_broad_context",
+        "use_multi_query": True,
+        "vector_top_k": 8,
+        "bm25_top_k": 6,
+        "final_top_k": 5,
+        "parent_window": 2,
+        "parent_max_chars": 1500,
+        "max_context_chars": 2800,
+        "per_chunk_max_chars": 520,
+    },
+    "plan": {
+        "strategy_name": "plan_learning_context",
+        "use_multi_query": True,
+        "vector_top_k": 6,
+        "bm25_top_k": 5,
+        "final_top_k": 4,
+        "parent_window": 1,
+        "parent_max_chars": 1100,
+        "max_context_chars": 2300,
+        "per_chunk_max_chars": 480,
+    },
+    "quiz": {
+        "strategy_name": "quiz_grounded_context",
+        "use_multi_query": True,
+        "vector_top_k": 6,
+        "bm25_top_k": 6,
+        "final_top_k": 4,
+        "parent_window": 1,
+        "parent_max_chars": 1100,
+        "max_context_chars": 2300,
+        "per_chunk_max_chars": 480,
+    },
+    "general": {
+        "strategy_name": "balanced_default",
+        "use_multi_query": False,
+        "vector_top_k": 5,
+        "bm25_top_k": 5,
+        "final_top_k": 3,
+        "parent_window": 1,
+        "parent_max_chars": 900,
+        "max_context_chars": 1800,
+        "per_chunk_max_chars": 420,
+    },
+}
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -24,6 +120,10 @@ def _extract_json_object(text: str) -> dict | None:
 def _normalize_query(query: str) -> str:
     cleaned = re.sub(r"\s+", " ", (query or "").strip())
     return cleaned
+
+
+def _contains_any(query: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in query for token in tokens)
 
 
 def _summarize_history(history: list[dict] | None) -> str:
@@ -128,7 +228,16 @@ def expand_query_to_multi_queries(
     queries = [base_query] if base_query else []
     reason = "single_query"
 
-    if any(token in base_query for token in COMPARE_TOKENS):
+    if any(token in base_query for token in INTERVIEW_TOKENS):
+        reason = "interview_query"
+        queries.extend(
+            [
+                f"{original_query} 的核心概念和高频面试考点",
+                f"{original_query} 的常见追问和回答要点",
+                f"{original_query} 的原理、场景和易错点",
+            ]
+        )
+    elif any(token in base_query for token in COMPARE_TOKENS):
         reason = "compare_query"
         compare_parts = re.split(r"[和与及、/]|vs|VS", original_query)
         compare_parts = [item.strip(" ：:，,。?？") for item in compare_parts if item.strip(" ：:，,。?？")]
@@ -220,3 +329,58 @@ def expand_query_to_multi_queries(
         pass
 
     return payload
+
+
+def classify_question_type(query: str, session_context: str = "", mode: str = "chat") -> dict:
+    normalized = _normalize_query(query)
+    signals = []
+
+    if mode == "interview" or _contains_any(normalized, INTERVIEW_TOKENS):
+        question_type = "interview"
+        signals.append("interview_token")
+    elif _contains_any(normalized, PLAN_TOKENS):
+        question_type = "plan"
+        signals.append("plan_token")
+    elif _contains_any(normalized, QUIZ_TOKENS):
+        question_type = "quiz"
+        signals.append("quiz_token")
+    elif _contains_any(normalized, COMPARE_TOKENS):
+        question_type = "compare"
+        signals.append("compare_token")
+    elif _contains_any(normalized, WHY_TOKENS):
+        question_type = "why"
+        signals.append("why_token")
+    elif _contains_any(normalized, SUMMARY_TOKENS):
+        question_type = "summary"
+        signals.append("summary_token")
+    elif _contains_any(normalized, DEFINITION_TOKENS):
+        question_type = "fact"
+        signals.append("definition_token")
+    else:
+        question_type = "general"
+        signals.append("fallback")
+
+    confidence = 0.55 if question_type == "general" else 0.75
+    if len(normalized) <= 8 and question_type == "general":
+        confidence = 0.45
+
+    return {
+        "question_type": question_type,
+        "confidence": confidence,
+        "signals": signals,
+    }
+
+
+def plan_retrieval_route(
+    original_query: str,
+    rewritten_query: str = "",
+    session_context: str = "",
+    mode: str = "chat",
+) -> dict:
+    classification = classify_question_type(rewritten_query or original_query, session_context=session_context, mode=mode)
+    question_type = classification["question_type"]
+    profile = {**ROUTE_PROFILES["general"], **ROUTE_PROFILES.get(question_type, {})}
+    return {
+        "classification": classification,
+        "route_strategy": profile,
+    }

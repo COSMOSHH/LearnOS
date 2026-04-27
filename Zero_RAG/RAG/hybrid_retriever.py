@@ -35,26 +35,45 @@ class HybridRetriever:
         results, _ = self.retrieve_with_debug(query)
         return results
 
-    def retrieve_with_debug(self, query: str, queries: list[str] | None = None) -> tuple[List[Dict], Dict]:
+    def retrieve_with_debug(
+        self,
+        query: str,
+        queries: list[str] | None = None,
+        vector_top_k: int | None = None,
+        bm25_top_k: int | None = None,
+        final_top_k: int | None = None,
+        parent_window: int | None = None,
+        parent_max_chars: int | None = None,
+    ) -> tuple[List[Dict], Dict]:
         query_candidates = queries or [query]
+        vector_top_k = max(1, int(vector_top_k or self.vector_top_k))
+        bm25_top_k = max(1, int(bm25_top_k or self.bm25_top_k))
+        final_top_k = max(1, int(final_top_k or self.final_top_k))
+        parent_window = max(0, int(parent_window if parent_window is not None else 1))
+        parent_max_chars = max(200, int(parent_max_chars or 900))
         debug_payload = {
             "query": query,
             "query_strategy": "multi_query" if len(query_candidates) > 1 else "single_query",
             "expanded_queries": query_candidates,
-            "vector_top_k": self.vector_top_k,
-            "bm25_top_k": self.bm25_top_k,
-            "final_top_k": self.final_top_k,
+            "vector_top_k": vector_top_k,
+            "bm25_top_k": bm25_top_k,
+            "final_top_k": final_top_k,
             "vector_candidates": [],
             "bm25_candidates": [],
             "reranked_results": [],
             "parent_enriched": 0,
+            "parent_strategy": {
+                "window": parent_window,
+                "max_chars": parent_max_chars,
+            },
+            "parent_debug": [],
         }
 
         merged_candidates = {}
         for expanded_query in query_candidates:
             vector_results = self.vector_store.similarity_search(
                 expanded_query,
-                top_k=self.vector_top_k,
+                top_k=vector_top_k,
                 where=self.vector_where,
             )
             for result in vector_results:
@@ -78,7 +97,7 @@ class HybridRetriever:
 
             tokenized_query = list(jieba.cut(expanded_query))
             bm25_scores = self.bm25.get_scores(tokenized_query) if self.doc_chunks else []
-            bm25_top_n_idx = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[: self.bm25_top_k]
+            bm25_top_n_idx = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:bm25_top_k]
 
             for index in bm25_top_n_idx:
                 chunk = self.doc_chunks[index]
@@ -102,7 +121,16 @@ class HybridRetriever:
                 )
 
         merged_items = list(merged_candidates.values())
-        unique_texts = [self._expand_to_parent_document(item["document"], item["metadata"], debug_payload) for item in merged_items]
+        unique_texts = [
+            self._expand_to_parent_document(
+                item["document"],
+                item["metadata"],
+                debug_payload,
+                parent_window=parent_window,
+                parent_max_chars=parent_max_chars,
+            )
+            for item in merged_items
+        ]
         if not unique_texts:
             return [], debug_payload
 
@@ -111,7 +139,7 @@ class HybridRetriever:
                 model=config.rerank_model,
                 query=query,
                 documents=unique_texts,
-                top_n=self.final_top_k,
+                top_n=final_top_k,
                 return_documents=False,
             )
             if response.status_code == 200:
@@ -139,7 +167,7 @@ class HybridRetriever:
             pass
 
         fallback_results = []
-        for item in merged_items[: self.final_top_k]:
+        for index, item in enumerate(merged_items[:final_top_k]):
             debug_payload["reranked_results"].append(
                 {
                     "document_title": item["metadata"].get("document_title", ""),
@@ -148,7 +176,7 @@ class HybridRetriever:
                     "rerank_score": 0.0,
                 }
             )
-            fallback_results.append({"document": item["document"], "metadata": item["metadata"], "score": 0.0})
+            fallback_results.append({"document": unique_texts[index], "metadata": item["metadata"], "score": 0.0})
         return fallback_results, debug_payload
 
     def _build_candidate_key(self, document: str, metadata: dict) -> str:
@@ -165,7 +193,15 @@ class HybridRetriever:
             section_key = self._build_section_key(metadata)
             if not section_key:
                 continue
-            sections.setdefault(section_key, []).append(chunk["chunk_text"])
+            sections.setdefault(section_key, []).append(
+                {
+                    "text": chunk["chunk_text"],
+                    "chunk_index": self._safe_int(metadata.get("chunk_index")),
+                    "metadata": metadata,
+                }
+            )
+        for section_chunks in sections.values():
+            section_chunks.sort(key=lambda item: item["chunk_index"])
         return sections
 
     def _build_section_key(self, metadata: dict) -> str:
@@ -175,13 +211,57 @@ class HybridRetriever:
             return ""
         return f"{document_id}::{heading_path}"
 
-    def _expand_to_parent_document(self, document: str, metadata: dict, debug_payload: dict) -> str:
+    def _expand_to_parent_document(
+        self,
+        document: str,
+        metadata: dict,
+        debug_payload: dict,
+        parent_window: int = 1,
+        parent_max_chars: int = 900,
+    ) -> str:
         section_key = self._build_section_key(metadata)
         parent_chunks = self.parent_sections.get(section_key, [])
         if len(parent_chunks) <= 1:
             return document
+
+        hit_chunk_index = self._safe_int(metadata.get("chunk_index"))
+        hit_position = 0
+        for index, item in enumerate(parent_chunks):
+            if item["chunk_index"] == hit_chunk_index:
+                hit_position = index
+                break
+
+        window_start = max(0, hit_position - parent_window)
+        window_end = min(len(parent_chunks), hit_position + parent_window + 1)
+        selected_chunks = parent_chunks[window_start:window_end]
+        selected_texts = [item["text"] for item in selected_chunks if item.get("text")]
+        joined = "\n\n".join(selected_texts) or document
+
+        truncated = False
+        if len(joined) > parent_max_chars:
+            truncated = True
+            hit_text = document[: min(len(document), parent_max_chars)]
+            neighbor_budget = max(0, parent_max_chars - len(hit_text) - 2)
+            neighbor_text = "\n\n".join(text for text in selected_texts if text != document)
+            joined = f"{hit_text}\n\n{neighbor_text[:neighbor_budget]}".strip()[:parent_max_chars]
+
         debug_payload["parent_enriched"] += 1
-        joined = "\n\n".join(parent_chunks)
-        if len(joined) > 900:
-            return joined[:900]
+        debug_payload["parent_debug"].append(
+            {
+                "document_id": metadata.get("document_id", ""),
+                "heading_path": metadata.get("heading_path") or metadata.get("section_title", ""),
+                "hit_chunk_index": hit_chunk_index,
+                "selected_count": len(selected_texts),
+                "window_start": window_start,
+                "window_end": max(window_start, window_end - 1),
+                "parent_chars": len(joined),
+                "truncated": truncated,
+            }
+        )
         return joined
+
+    def _safe_int(self, value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default

@@ -1,0 +1,44 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# IDE and editor settings
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime databases and local state
+*.sqlite3
+*.db
+*.db-journal
+Zero_RAG/processed_md5.json
+
+# Vector store and uploaded/generated local data
+Zero_RAG/chroma_db/
+uploaded_study_materials/
+codex_chat/
+
+# Local logs and temp files
+*.log
+*.tmp
+*.temp

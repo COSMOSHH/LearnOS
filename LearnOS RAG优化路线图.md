@@ -394,9 +394,9 @@ LearnOS 当前最缺的不是“换一个更大的向量库”，而是把查询
 
 下一阶段建议从这里继续推进：
 
-1. 问题类型识别与检索路由
-2. 评测集分桶统计
-3. RAG 质量看板
+1. 扩大评测样本库与跨会话趋势
+2. 按资料类型、问题类型细化分桶统计
+3. 将低质 query 样本反向生成评测 case
 
 ## V1.2 当前进度
 
@@ -412,3 +412,26 @@ LearnOS 当前最缺的不是“换一个更大的向量库”，而是把查询
    已补充展示 Multi-Query 策略、扩展 query、Parent-Child 回填次数和 Context Compression 调试信息。
 
 这意味着 LearnOS 当前的 RAG 已经从 `RAG V1.1` 进一步升级到“带查询扩展、多粒度上下文和上下文治理”的版本。
+
+## V1.2 后续优化与 RAG V2 当前进度
+
+当前 `V1.2 后续优化` 与 `RAG V2` 第一版已经完成，新增落地内容如下：
+
+1. `更完整语义分块`
+   `SemanticTextSplitter` 增加语义块识别，优先保留代码块、表格、列表、段落等结构，再进行长度合并与切分。
+2. `Parent 回填策略精细化`
+   `HybridRetriever` 支持围绕命中 child chunk 的邻近窗口回填 parent context，并输出 `parent_strategy` 与 `parent_debug`。
+3. `问题类型识别与检索路由`
+   `query_service` 新增事实、对比、原因、总结、面试、计划、测验类问题识别，并为不同类型动态设置 Multi-Query、top-k、Parent 窗口和上下文预算。
+4. `评测分桶与低质 query 沉淀`
+   RAG 评测结果新增按问题类型分桶指标，低质量 query 会写入 `rag_quality_samples`。
+5. `RAG 质量看板`
+   新增 `GET /study_sessions/{session_id}/rag/quality` 和前端 `RAG质量` 页签，展示 MRR、Recall@1、路由分布、低质原因分布和样本库。
+
+当前状态可以更新为：
+
+1. `RAG V1.1` 已完成
+2. `RAG V1.2` 已完成
+3. `RAG V1.2 后续优化` 已完成第一版
+4. `RAG V1.3` 已完成第一版
+5. `RAG V2` 已完成第一版

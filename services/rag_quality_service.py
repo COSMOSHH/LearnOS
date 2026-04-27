@@ -1,6 +1,19 @@
+import json
+import sqlite3
 from collections import Counter
+from pathlib import Path
 
 from services.observability_service import list_recent_events, list_recent_runs
+from services.query_service import classify_question_type
+
+
+DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
+
+
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -8,6 +21,82 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _load_json(value: str | None, default):
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def save_low_quality_samples(
+    session_id: int,
+    user_id: str,
+    low_quality_cases: list[dict],
+    metrics: dict | None = None,
+    source_run_id: int | None = None,
+) -> int:
+    if not low_quality_cases:
+        return 0
+
+    conn = _connect()
+    cursor = conn.cursor()
+    saved_count = 0
+    for item in low_quality_cases:
+        query_text = (item.get("query") or "").strip()
+        if not query_text:
+            continue
+        question_type = item.get("question_type") or classify_question_type(query_text).get("question_type", "unknown")
+        cursor.execute(
+            """
+            INSERT INTO rag_quality_samples
+            (session_id, user_id, query_text, rewritten_query, question_type, reason, reciprocal_rank, top1_json, metrics_json, source_run_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                user_id,
+                query_text,
+                item.get("rewritten_query", ""),
+                question_type,
+                item.get("reason", ""),
+                _safe_float(item.get("reciprocal_rank"), 0.0),
+                json.dumps(item.get("top1", {}), ensure_ascii=False),
+                json.dumps(metrics or {}, ensure_ascii=False),
+                source_run_id,
+            ),
+        )
+        saved_count += 1
+    conn.commit()
+    conn.close()
+    return saved_count
+
+
+def list_low_quality_samples(session_id: int, limit: int = 50, status: str | None = None) -> list[dict]:
+    conn = _connect()
+    cursor = conn.cursor()
+    params = [session_id]
+    query = """
+        SELECT *
+        FROM rag_quality_samples
+        WHERE session_id = ?
+    """
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(max(1, int(limit or 50)))
+    cursor.execute(query, tuple(params))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    for row in rows:
+        row["top1"] = _load_json(row.get("top1_json"), {})
+        row["metrics"] = _load_json(row.get("metrics_json"), {})
+    return rows
 
 
 def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
@@ -20,6 +109,8 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
     low_quality_counts = []
     question_type_counter = Counter()
     route_strategy_counter = Counter()
+    low_quality_reason_counter = Counter()
+    low_quality_type_counter = Counter()
 
     for run in rag_eval_runs:
         metadata = run.get("metadata") or {}
@@ -34,6 +125,11 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
         route_name = ((metadata.get("route_strategy") or {}).get("strategy_name") or "default").strip() or "default"
         question_type_counter[question_type] += 1
         route_strategy_counter[route_name] += 1
+
+    low_quality_samples = list_low_quality_samples(session_id=session_id, limit=limit)
+    for sample in low_quality_samples:
+        low_quality_reason_counter[sample.get("reason") or "unknown"] += 1
+        low_quality_type_counter[sample.get("question_type") or "unknown"] += 1
 
     events = list_recent_events(limit=max(1, int(limit or 50)), session_id=session_id)
     eval_events = [item for item in events if item.get("event_type") == "rag.evaluate"]
@@ -60,11 +156,15 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
             "avg_mrr": avg_mrr,
             "avg_recall_at_1": avg_recall_at_1,
             "avg_low_quality_count": avg_low_quality_count,
+            "low_quality_sample_count": len(low_quality_samples),
         },
         "distributions": {
             "question_type": dict(question_type_counter),
             "route_strategy": dict(route_strategy_counter),
+            "low_quality_reason": dict(low_quality_reason_counter),
+            "low_quality_question_type": dict(low_quality_type_counter),
         },
         "low_quality_trend": low_quality_trend,
+        "low_quality_samples": low_quality_samples[:20],
         "recent_eval_runs": rag_eval_runs[:10],
     }

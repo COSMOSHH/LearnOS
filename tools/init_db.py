@@ -317,6 +317,25 @@ def init_study_db() -> str:
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rag_quality_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            user_id TEXT,
+            query_text TEXT NOT NULL,
+            rewritten_query TEXT,
+            question_type TEXT,
+            reason TEXT,
+            reciprocal_rank REAL DEFAULT 0,
+            top1_json TEXT,
+            metrics_json TEXT,
+            source_run_id INTEGER,
+            status TEXT DEFAULT 'open',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_date ON study_sessions(user_id, session_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_documents_session_id ON study_documents(session_id)")
@@ -336,6 +355,8 @@ def init_study_db() -> str:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_interview_turns_session_id ON interview_turns(interview_session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_session_id ON agent_runs(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_run_steps_run_id ON agent_run_steps(run_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rag_quality_samples_session_id ON rag_quality_samples(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rag_quality_samples_type ON rag_quality_samples(question_type, reason)")
 
     _ensure_column(cursor, "study_documents", "source_type", "TEXT DEFAULT 'upload'")
     _ensure_column(cursor, "study_documents", "metadata_json", "TEXT")

@@ -54,8 +54,9 @@ from services.plan_service import (
     save_learning_plan,
     update_plan_item_completion,
 )
-from services.query_service import expand_query_to_multi_queries, rewrite_query
+from services.query_service import expand_query_to_multi_queries, plan_retrieval_route, rewrite_query
 from services.rag_eval_service import build_eval_dataset_template, build_session_eval_cases, evaluate_retrieval_cases
+from services.rag_quality_service import build_rag_quality_dashboard, save_low_quality_samples
 from services.quiz_service import (
     create_quiz_set,
     generate_quiz_bundle,
@@ -1001,10 +1002,18 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             eval_cases,
             rewrite_query=rewrite_query,
             expand_query_to_multi_queries=expand_query_to_multi_queries,
+            plan_retrieval_route=plan_retrieval_route,
             session_context=_build_session_context_text(session_id),
             llm_generator=llm_generator,
             top_k=request.top_k,
             low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+        )
+        low_quality_sample_count = save_low_quality_samples(
+            session_id=session_id,
+            user_id=request.user_id,
+            low_quality_cases=payload.get("low_quality_cases", []),
+            metrics=payload.get("metrics", {}),
+            source_run_id=run_id,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         _record_run_step_safe(
@@ -1015,7 +1024,9 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
                 "case_count": payload.get("case_count", 0),
                 "mrr": payload.get("metrics", {}).get("mrr", 0),
                 "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "buckets": payload.get("metrics", {}).get("buckets", {}),
                 "low_quality_count": len(payload.get("low_quality_cases", [])),
+                "low_quality_sample_count": low_quality_sample_count,
             },
         )
         _finish_run_safe(
@@ -1026,7 +1037,9 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             metadata={
                 "mrr": payload.get("metrics", {}).get("mrr", 0),
                 "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "buckets": payload.get("metrics", {}).get("buckets", {}),
                 "low_quality_count": len(payload.get("low_quality_cases", [])),
+                "low_quality_sample_count": low_quality_sample_count,
             },
         )
         _record_event_safe(
@@ -1037,7 +1050,9 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             metadata={
                 "case_count": payload.get("case_count", 0),
                 "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "buckets": payload.get("metrics", {}).get("buckets", {}),
                 "low_quality_count": len(payload.get("low_quality_cases", [])),
+                "low_quality_sample_count": low_quality_sample_count,
             },
         )
         return {"session_id": session_id, **payload}
@@ -1060,6 +1075,14 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             message=str(exc),
         )
         raise
+
+
+@app.get("/study_sessions/{session_id}/rag/quality")
+async def get_rag_quality_dashboard_endpoint(session_id: int, limit: int = Query(50)):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    return build_rag_quality_dashboard(session_id=session_id, limit=limit)
 
 
 @app.post("/study_sessions/{session_id}/interview_sessions")
@@ -1443,23 +1466,43 @@ async def agent_chat_endpoint(request: ChatRequest):
         if request.session_id is not None:
             retriever, _ = _build_session_retriever(request.session_id)
             if retriever:
+                session_context = _build_session_context_text(request.session_id)
                 rewrite_payload = rewrite_query(
                     request.query,
                     history=[],
-                    session_context=_build_session_context_text(request.session_id),
+                    session_context=session_context,
                     llm_generator=llm_generator,
                 )
-                expanded_query_payload = expand_query_to_multi_queries(
-                    original_query=request.query,
+                route_payload = plan_retrieval_route(
+                    request.query,
                     rewritten_query=rewrite_payload["rewritten_query"],
-                    session_context=_build_session_context_text(request.session_id),
-                    llm_generator=llm_generator,
+                    session_context=session_context,
+                    mode="chat",
                 )
+                route_strategy = route_payload["route_strategy"]
+                if route_strategy.get("use_multi_query"):
+                    expanded_query_payload = expand_query_to_multi_queries(
+                        original_query=request.query,
+                        rewritten_query=rewrite_payload["rewritten_query"],
+                        session_context=session_context,
+                        llm_generator=llm_generator,
+                    )
+                else:
+                    expanded_query_payload = {"strategy": "routed_single_query", "queries": [rewrite_payload["rewritten_query"]]}
                 retrieved_results, _ = retriever.retrieve_with_debug(
                     rewrite_payload["rewritten_query"],
                     queries=expanded_query_payload["queries"],
+                    vector_top_k=route_strategy.get("vector_top_k"),
+                    bm25_top_k=route_strategy.get("bm25_top_k"),
+                    final_top_k=route_strategy.get("final_top_k"),
+                    parent_window=route_strategy.get("parent_window"),
+                    parent_max_chars=route_strategy.get("parent_max_chars"),
                 )
-                retrieved_results, _ = build_generation_context(retrieved_results)
+                retrieved_results, _ = build_generation_context(
+                    retrieved_results,
+                    max_context_chars=route_strategy.get("max_context_chars", 1800),
+                    per_chunk_max_chars=route_strategy.get("per_chunk_max_chars", 420),
+                )
                 state.user_info["rag_context"] = "\n".join(
                     [f"- {item['metadata'].get('source', 'unknown')}: {item['document']}" for item in retrieved_results]
                 )
@@ -1492,35 +1535,32 @@ async def chat_endpoint(request: ChatRequest):
             chat_history.append({"role": "user", "content": item["query"]})
             chat_history.append({"role": "assistant", "content": item["response"]})
 
+        session_context = _build_session_context_text(request.session_id)
+        rewrite_started = time.perf_counter()
         rewrite_payload = rewrite_query(
             request.query,
             history=chat_history,
-            session_context=_build_session_context_text(request.session_id),
+            session_context=session_context,
             llm_generator=llm_generator,
         )
-        expanded_query_payload = expand_query_to_multi_queries(
-            original_query=request.query,
+        route_payload = plan_retrieval_route(
+            request.query,
             rewritten_query=rewrite_payload["rewritten_query"],
-            session_context=_build_session_context_text(request.session_id),
-            llm_generator=llm_generator,
+            session_context=session_context,
+            mode="chat",
         )
-        retrieve_started = time.perf_counter()
-        retrieved_results, retrieval_debug = retriever.retrieve_with_debug(
-            rewrite_payload["rewritten_query"],
-            queries=expanded_query_payload["queries"],
-        )
-        generation_results, context_debug = build_generation_context(retrieved_results)
-        retrieval_debug.update(
-            {
-                "original_query": rewrite_payload["original_query"],
-                "rewritten_query": rewrite_payload["rewritten_query"],
-                "rewrite_reason": rewrite_payload["rewrite_reason"],
-                "query_strategy": expanded_query_payload["strategy"],
-                "expanded_queries": expanded_query_payload["queries"],
-                "context_debug": context_debug,
-            }
-        )
-        sources = _format_sources(generation_results)
+        route_strategy = route_payload["route_strategy"]
+        classification = route_payload["classification"]
+        if route_strategy.get("use_multi_query"):
+            expanded_query_payload = expand_query_to_multi_queries(
+                original_query=request.query,
+                rewritten_query=rewrite_payload["rewritten_query"],
+                session_context=session_context,
+                llm_generator=llm_generator,
+            )
+        else:
+            expanded_query_payload = {"strategy": "routed_single_query", "queries": [rewrite_payload["rewritten_query"]]}
+
         run_id = create_run(
             run_type="study_chat",
             session_id=request.session_id,
@@ -1528,15 +1568,58 @@ async def chat_endpoint(request: ChatRequest):
             title="学习问答",
             input_summary=request.query[:160],
             metadata={
-                "source_count": len(sources),
+                "original_query": rewrite_payload["original_query"],
+                "rewritten_query": rewrite_payload["rewritten_query"],
+                "rewrite_reason": rewrite_payload["rewrite_reason"],
+                "question_type": classification["question_type"],
+                "question_type_confidence": classification["confidence"],
+                "route_strategy": route_strategy,
+                "query_strategy": expanded_query_payload["strategy"],
+                "expanded_queries": expanded_query_payload["queries"],
+            },
+        )
+        _record_run_step_safe(
+            run_id,
+            "query_rewrite_and_route",
+            duration_ms=int((time.perf_counter() - rewrite_started) * 1000),
+            metadata={
+                "rewrite": rewrite_payload,
+                "classification": classification,
+                "route_strategy": route_strategy,
+                "expanded_queries": expanded_query_payload["queries"],
+            },
+        )
+
+        retrieve_started = time.perf_counter()
+        retrieved_results, retrieval_debug = retriever.retrieve_with_debug(
+            rewrite_payload["rewritten_query"],
+            queries=expanded_query_payload["queries"],
+            vector_top_k=route_strategy.get("vector_top_k"),
+            bm25_top_k=route_strategy.get("bm25_top_k"),
+            final_top_k=route_strategy.get("final_top_k"),
+            parent_window=route_strategy.get("parent_window"),
+            parent_max_chars=route_strategy.get("parent_max_chars"),
+        )
+        generation_results, context_debug = build_generation_context(
+            retrieved_results,
+            max_context_chars=route_strategy.get("max_context_chars", 1800),
+            per_chunk_max_chars=route_strategy.get("per_chunk_max_chars", 420),
+        )
+        retrieval_debug.update(
+            {
                 "original_query": rewrite_payload["original_query"],
                 "rewritten_query": rewrite_payload["rewritten_query"],
                 "rewrite_reason": rewrite_payload["rewrite_reason"],
                 "query_strategy": expanded_query_payload["strategy"],
                 "expanded_queries": expanded_query_payload["queries"],
-                "retrieval_debug": retrieval_debug,
-            },
+                "question_type": classification["question_type"],
+                "question_type_confidence": classification["confidence"],
+                "question_type_signals": classification.get("signals", []),
+                "route_strategy": route_strategy,
+                "context_debug": context_debug,
+            }
         )
+        sources = _format_sources(generation_results)
         _record_run_step_safe(
             run_id,
             "retrieve",
@@ -1547,7 +1630,10 @@ async def chat_endpoint(request: ChatRequest):
                 "rewritten_query": rewrite_payload["rewritten_query"],
                 "query_strategy": expanded_query_payload["strategy"],
                 "expanded_queries": expanded_query_payload["queries"],
+                "question_type": classification["question_type"],
+                "route_strategy": route_strategy,
                 "context_debug": context_debug,
+                "parent_debug": retrieval_debug.get("parent_debug", []),
             },
         )
 
@@ -1616,7 +1702,11 @@ async def chat_endpoint(request: ChatRequest):
                     status="success",
                     output_summary=full_response[:180],
                     duration_ms=int((time.perf_counter() - run_started) * 1000),
-                    metadata={"evaluation_score": evaluation.get("overall_score", 0)},
+                    metadata={
+                        "evaluation_score": evaluation.get("overall_score", 0),
+                        "source_count": len(sources),
+                        "retrieval_debug": retrieval_debug,
+                    },
                 )
             except Exception as inner_exc:
                 error_msg = f"\n\n[backend streaming error: {inner_exc}]"
