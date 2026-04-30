@@ -5,6 +5,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from services.db import connect_study_db
+
 
 DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
 REVIEW_OUTCOME_RULES = {
@@ -16,9 +18,7 @@ REVIEW_OUTCOME_RULES = {
 
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_study_db(DB_PATH)
 
 
 def _tokenize(text: str) -> list[str]:

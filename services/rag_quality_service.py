@@ -3,6 +3,7 @@ import sqlite3
 from collections import Counter
 from pathlib import Path
 
+from services.db import connect_study_db
 from services.observability_service import list_recent_events, list_recent_runs
 from services.query_service import classify_question_type
 
@@ -11,9 +12,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
 
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_study_db(DB_PATH)
 
 
 def _safe_float(value, default: float = 0.0) -> float:

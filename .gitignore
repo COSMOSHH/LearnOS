@@ -42,3 +42,10 @@ codex_chat/
 *.log
 *.tmp
 *.temp
+.pytest_cache/
+pytest-cache-files-*/
+
+
+# 简历项目经历-LearnOS.md
+简历项目经历-LearnOS.md
+

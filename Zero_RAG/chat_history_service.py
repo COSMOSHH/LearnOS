@@ -2,6 +2,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from services.db import connect_chat_db, is_mysql
+
 
 DB_FILE = Path(__file__).resolve().parent.parent / "chat_history.sqlite3"
 
@@ -31,46 +33,77 @@ class ThreadState:
 
 
 def _column_exists(cursor, table_name: str, column_name: str) -> bool:
+    if is_mysql():
+        cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE ?", (column_name,))
+        return cursor.fetchone() is not None
     cursor.execute(f"PRAGMA table_info({table_name})")
     return any(row[1] == column_name for row in cursor.fetchall())
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = connect_chat_db(DB_FILE)
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            query TEXT NOT NULL,
-            response TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    if is_mysql():
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                user_id VARCHAR(128) NOT NULL,
+                query LONGTEXT NOT NULL,
+                response LONGTEXT NOT NULL,
+                session_id BIGINT,
+                sources_json LONGTEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_chat_history_user_session (user_id, session_id),
+                INDEX idx_chat_history_timestamp (timestamp)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
         )
-        """
-    )
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                response TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
     if not _column_exists(cursor, "chat_history", "session_id"):
         cursor.execute("ALTER TABLE chat_history ADD COLUMN session_id INTEGER")
     if not _column_exists(cursor, "chat_history", "sources_json"):
         cursor.execute("ALTER TABLE chat_history ADD COLUMN sources_json TEXT")
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS thread_state (
-            thread_id TEXT PRIMARY KEY,
-            state_data TEXT NOT NULL,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    if is_mysql():
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_state (
+                thread_id VARCHAR(255) PRIMARY KEY,
+                state_data LONGTEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
         )
-        """
-    )
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_state (
+                thread_id TEXT PRIMARY KEY,
+                state_data TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
     conn.commit()
     conn.close()
 
 
 def save_thread_state(state: ThreadState):
-    conn = sqlite3.connect(DB_FILE)
+    conn = connect_chat_db(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -84,7 +117,7 @@ def save_thread_state(state: ThreadState):
 
 
 def load_thread_state(thread_id: str) -> ThreadState:
-    conn = sqlite3.connect(DB_FILE)
+    conn = connect_chat_db(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT state_data FROM thread_state WHERE thread_id = ?", (thread_id,))
     row = cursor.fetchone()
@@ -95,7 +128,7 @@ def load_thread_state(thread_id: str) -> ThreadState:
 
 
 def save_chat_history(user_id: str, query: str, response: str, session_id: int | None = None, sources=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = connect_chat_db(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -109,7 +142,7 @@ def save_chat_history(user_id: str, query: str, response: str, session_id: int |
 
 
 def get_user_history(user_id: str, session_id: int | None = None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = connect_chat_db(DB_FILE)
     cursor = conn.cursor()
     if session_id is None:
         cursor.execute(
@@ -145,7 +178,7 @@ def get_user_history(user_id: str, session_id: int | None = None):
 
 
 def delete_session_history(user_id: str, session_id: int):
-    conn = sqlite3.connect(DB_FILE)
+    conn = connect_chat_db(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         "DELETE FROM chat_history WHERE user_id = ? AND session_id = ?",

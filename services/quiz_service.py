@@ -3,15 +3,15 @@ import re
 import sqlite3
 from pathlib import Path
 
+from services.db import connect_study_db
+
 
 DB_PATH = Path(__file__).resolve().parent.parent / "study_agent.sqlite3"
 OBJECTIVE_TYPES = {"single_choice", "multiple_choice", "fill_blank"}
 
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_study_db(DB_PATH)
 
 
 def _extract_json_object(text: str) -> dict | None:

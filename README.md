@@ -323,3 +323,43 @@ streamlit run Zero_RAG/Client.py
    `rag_quality_samples` 会保存评测中的 no_hit、late_hit、weak_top1 等低质量样本。
 5. `RAG质量看板`
    新增接口 `GET /study_sessions/{session_id}/rag/quality` 和前端 `RAG质量` 页签，可查看质量摘要、路由分布、低质原因分布和样本库。
+## MySQL Docker 数据库迁移
+
+当前版本已经完成 SQLite 到 Docker MySQL 的第一版迁移。
+
+默认 MySQL 连接配置：
+
+```env
+DB_TYPE=mysql
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3307
+MYSQL_DATABASE=rag_db
+MYSQL_USER=rag_user
+MYSQL_PASSWORD=rag123456
+```
+
+初始化 MySQL 表结构：
+
+```bash
+python tools/init_db.py
+```
+
+从 SQLite 迁移历史数据到 MySQL：
+
+```bash
+python tools/migrate_sqlite_to_mysql.py --clear
+```
+
+只检查 SQLite 中可迁移的数据量，不写入 MySQL：
+
+```bash
+python tools/migrate_sqlite_to_mysql.py --dry-run
+```
+
+如需临时回退 SQLite：
+
+```env
+DB_TYPE=sqlite
+```
+
+本次迁移保留 ChromaDB 作为独立向量库，仅将学习会话、文档元数据、聊天历史、测验、错题、复习、学习计划、RAG 评测与质量看板等业务数据切换到 MySQL。
