@@ -80,15 +80,21 @@ LearnOS/
 │   ├── summary_service.py       # 摘要与会话元信息生成
 │   └── webpage_service.py       # 网页正文抽取
 ├── tools/
-│   └── init_db.py               # SQLite 初始化
+│   ├── init_db.py               # SQLite 初始化
+│   └── prepare_scifact_benchmark.py # SciFact benchmark 转换
+├── docs/                        # 项目文档、计划、报告、面试材料
+│   ├── architecture/
+│   ├── plans/
+│   ├── reports/
+│   └── interview/
+├── benchmarks/                  # 固定 RAG benchmark 转换产物
+├── datasets/                    # 本地原始数据集，不纳入版本管理
 ├── requirements.txt
 ├── tests/
 │   ├── test_api.py              # FastAPI 接口层测试
 │   └── test_services.py         # 最小服务层测试
 ├── README.md
-├── 阶段性完成报告.md
-├── 产品功能清单与优先级.md
-└── 数据库表结构设计.md
+└── rag_eval_cases.json          # 默认轻量 RAG 评测集
 ```
 
 ## 启动方式
@@ -254,15 +260,18 @@ streamlit run Zero_RAG/Client.py
 
 ## 相关文档
 
-1. [阶段性完成报告.md](阶段性完成报告.md)
-2. [产品功能清单与优先级.md](产品功能清单与优先级.md)
-3. [LearnOS RAG产品功能清单与优先级.md](LearnOS%20RAG产品功能清单与优先级.md)
-4. [LearnOS RAG优化路线图.md](LearnOS%20RAG优化路线图.md)
-5. [数据库表结构设计.md](数据库表结构设计.md)
-6. [项目面试预测问答.md](项目面试预测问答.md)
-7. [项目面试高频追问速记版.md](项目面试高频追问速记版.md)
-8. [项目拷打式深挖问答版.md](项目拷打式深挖问答版.md)
-9. [多Agent架构图.md](多Agent架构图.md)
+1. [最新推进计划与进度](docs/plans/LearnOS最新推进计划与进度.md)
+2. [Agent 与 RAG 能力分析](docs/reports/LearnOS%20Agent与RAG能力分析.md)
+3. [阶段性完成报告](docs/reports/阶段性完成报告.md)
+4. [All-in-RAG 对照检查清单](docs/reports/All-in-RAG%20对照检查清单.md)
+5. [产品功能清单与优先级](docs/plans/产品功能清单与优先级.md)
+6. [LearnOS RAG 产品功能清单与优先级](docs/plans/LearnOS%20RAG产品功能清单与优先级.md)
+7. [LearnOS RAG 优化路线图](docs/plans/LearnOS%20RAG优化路线图.md)
+8. [数据库表结构设计](docs/architecture/数据库表结构设计.md)
+9. [多 Agent 架构图](docs/architecture/多Agent架构图.md)
+10. [项目面试预测问答](docs/interview/项目面试预测问答.md)
+11. [项目面试高频追问速记版](docs/interview/项目面试高频追问速记版.md)
+12. [项目拷打式深挖问答版](docs/interview/项目拷打式深挖问答版.md)
 
 ## RAG V1.2 更新
 

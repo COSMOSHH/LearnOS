@@ -105,6 +105,7 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
 
     mrr_values = []
     recall_at_1_values = []
+    ndcg_at_5_values = []
     low_quality_counts = []
     question_type_counter = Counter()
     route_strategy_counter = Counter()
@@ -116,6 +117,8 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
         mrr_values.append(_safe_float(metadata.get("mrr"), 0.0))
         recall_at = metadata.get("recall_at") or {}
         recall_at_1_values.append(_safe_float(recall_at.get("1"), 0.0))
+        ndcg_at = metadata.get("ndcg_at") or {}
+        ndcg_at_5_values.append(_safe_float(ndcg_at.get("5"), 0.0))
         low_quality_counts.append(int(metadata.get("low_quality_count") or 0))
 
     for run in chat_runs:
@@ -145,6 +148,7 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
 
     avg_mrr = round(sum(mrr_values) / len(mrr_values), 4) if mrr_values else 0.0
     avg_recall_at_1 = round(sum(recall_at_1_values) / len(recall_at_1_values), 4) if recall_at_1_values else 0.0
+    avg_ndcg_at_5 = round(sum(ndcg_at_5_values) / len(ndcg_at_5_values), 4) if ndcg_at_5_values else 0.0
     avg_low_quality_count = round(sum(low_quality_counts) / len(low_quality_counts), 2) if low_quality_counts else 0.0
 
     return {
@@ -154,6 +158,7 @@ def build_rag_quality_dashboard(session_id: int, limit: int = 50) -> dict:
             "chat_run_count": len(chat_runs),
             "avg_mrr": avg_mrr,
             "avg_recall_at_1": avg_recall_at_1,
+            "avg_ndcg_at_5": avg_ndcg_at_5,
             "avg_low_quality_count": avg_low_quality_count,
             "low_quality_sample_count": len(low_quality_samples),
         },

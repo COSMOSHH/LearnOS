@@ -360,8 +360,8 @@ MySQL DDL 注意点：
 
 - [ ] 更新 `README.md`。
 - [ ] 更新 `requirements.txt`。
-- [ ] 更新 `数据库表结构设计.md`。
-- [ ] 更新 `阶段性完成报告.md`。
+- [ ] 更新 `docs/architecture/数据库表结构设计.md`。
+- [ ] 更新 `docs/reports/阶段性完成报告.md`。
 - [ ] 新增 MySQL Docker 启动说明。
 - [ ] 新增 SQLite 数据迁移说明。
 - [ ] 标注如何回滚到 SQLite。

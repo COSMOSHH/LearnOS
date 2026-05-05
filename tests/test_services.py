@@ -23,6 +23,7 @@ from services import (
     webpage_service,
 )
 from tools import init_db
+from tools.prepare_scifact_benchmark import build_corpus_markdown, build_eval_cases
 
 
 class FakeResponse:
@@ -256,7 +257,83 @@ class ServiceTests(unittest.TestCase):
         self.assertAlmostEqual(payload["metrics"]["recall_at"]["1"], 0.5)
         self.assertAlmostEqual(payload["metrics"]["recall_at"]["3"], 0.5)
         self.assertAlmostEqual(payload["metrics"]["mrr"], 0.5)
+        self.assertAlmostEqual(payload["metrics"]["ndcg_at"]["3"], 0.5)
         self.assertGreaterEqual(len(payload["low_quality_cases"]), 1)
+
+    def test_rag_eval_supports_doc_ids_and_ndcg(self):
+        class FakeRetriever:
+            def retrieve_with_debug(self, query, queries=None, **kwargs):
+                return (
+                    [
+                        {
+                            "document": "unrelated",
+                            "metadata": {"source": "scifact:bad", "heading_path": "scifact:bad"},
+                            "score": 0.9,
+                        },
+                        {
+                            "document": "relevant",
+                            "metadata": {"source": "scifact:doc-1", "heading_path": "scifact:doc-1 | Paper"},
+                            "score": 0.8,
+                        },
+                    ],
+                    {"debug": "ok"},
+                )
+
+        payload = rag_eval_service.evaluate_retrieval_cases(
+            FakeRetriever(),
+            [
+                {
+                    "query": "claim",
+                    "relevant_doc_ids": ["doc-1"],
+                    "relevant_scores": {"doc-1": 1},
+                }
+            ],
+            rewrite_query=lambda query, **kwargs: {
+                "original_query": query,
+                "rewritten_query": query,
+                "rewrite_reason": "test",
+            },
+            expand_query_to_multi_queries=lambda original_query, rewritten_query, **kwargs: {
+                "strategy": "single_query",
+                "queries": [rewritten_query or original_query],
+            },
+            session_context="SciFact",
+            llm_generator=None,
+            top_k=3,
+            low_quality_mrr_threshold=0.6,
+        )
+
+        self.assertEqual(payload["cases"][0]["first_hit_rank"], 2)
+        self.assertAlmostEqual(payload["metrics"]["mrr"], 0.5)
+        self.assertAlmostEqual(payload["metrics"]["recall_at"]["1"], 0.0)
+        self.assertAlmostEqual(payload["metrics"]["recall_at"]["3"], 1.0)
+        self.assertGreater(payload["metrics"]["ndcg_at"]["3"], 0.0)
+        self.assertLess(payload["metrics"]["ndcg_at"]["3"], 1.0)
+
+    def test_prepare_scifact_benchmark_outputs_cases_and_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_dir = Path(tmp_dir)
+            (dataset_dir / "qrels").mkdir()
+            (dataset_dir / "queries.jsonl").write_text(
+                '{"_id":"1","text":"Claim one","metadata":{}}\n',
+                encoding="utf-8",
+            )
+            (dataset_dir / "corpus.jsonl").write_text(
+                '{"_id":"doc-1","title":"Paper One","text":"Evidence text.","metadata":{}}\n',
+                encoding="utf-8",
+            )
+            (dataset_dir / "qrels" / "test.tsv").write_text(
+                "query-id\tcorpus-id\tscore\n1\tdoc-1\t1\n",
+                encoding="utf-8",
+            )
+
+            cases = build_eval_cases(dataset_dir, split="test")
+            corpus_markdown = build_corpus_markdown(dataset_dir)
+
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["query"], "Claim one")
+        self.assertEqual(cases[0]["relevant_doc_ids"], ["doc-1"])
+        self.assertIn("scifact:doc-1", corpus_markdown)
 
     def test_rag_quality_samples_and_dashboard(self):
         session = study_session_service.create_study_session("u1", "RAG质量测试", topic="MySQL 锁", goal="诊断检索质量")

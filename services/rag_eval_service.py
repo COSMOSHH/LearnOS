@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,20 @@ def _contains_any(haystack: str, needles: list[str]) -> bool:
     for item in needles:
         token = _normalize(item)
         if token and token in normalized_haystack:
+            return True
+    return False
+
+
+def _contains_doc_id(haystack: str, doc_ids: list[str]) -> bool:
+    normalized_haystack = _normalize(haystack)
+    if not normalized_haystack:
+        return False
+    for doc_id in doc_ids:
+        token = _normalize(str(doc_id))
+        if not token:
+            continue
+        pattern = rf"(?<![a-z0-9_-]){re.escape(token)}(?![a-z0-9_-])"
+        if re.search(pattern, normalized_haystack):
             return True
     return False
 
@@ -107,39 +122,101 @@ def build_session_eval_cases(
 
 
 def _is_relevant(result: dict, case: dict) -> bool:
+    return _relevance_grade(result, case) > 0
+
+
+def _source_text_for_result(result: dict) -> str:
     metadata = result.get("metadata") or {}
-    source = metadata.get("source", "")
+    return (
+        f"{metadata.get('source', '')} "
+        f"{metadata.get('document_title', '')} "
+        f"{metadata.get('heading_path', '')} "
+        f"{metadata.get('section_title', '')} "
+        f"{metadata.get('document_id', '')} "
+        f"{metadata.get('corpus_id', '')}"
+    )
+
+
+def _matched_relevant_doc_id(result: dict, case: dict) -> str | None:
+    source_text = _source_text_for_result(result)
+    for doc_id in [str(item) for item in case.get("relevant_doc_ids") or []]:
+        if _contains_doc_id(source_text, [doc_id]):
+            return doc_id
+    return None
+
+
+def _relevance_grade(result: dict, case: dict) -> float:
+    metadata = result.get("metadata") or {}
     title = metadata.get("document_title", "")
     heading_path = metadata.get("heading_path", "")
     section_title = metadata.get("section_title", "")
     document = result.get("document", "")
 
+    relevant_doc_ids = [str(item) for item in case.get("relevant_doc_ids") or []]
+    relevant_scores = {str(key): float(value) for key, value in (case.get("relevant_scores") or {}).items()}
     relevant_sources = case.get("relevant_sources") or []
     relevant_titles = case.get("relevant_titles") or []
     relevant_keywords = case.get("relevant_keywords") or []
 
-    source_text = f"{source} {title} {heading_path} {section_title}"
+    source_text = _source_text_for_result(result)
     doc_text = f"{title} {heading_path} {section_title} {document}"
+
+    if relevant_doc_ids:
+        matched_doc_id = _matched_relevant_doc_id(result, case)
+        if matched_doc_id:
+            return relevant_scores.get(matched_doc_id, 1.0)
 
     source_match = _contains_any(source_text, relevant_sources)
     title_match = _contains_any(source_text, relevant_titles)
     keyword_match = _contains_any(doc_text, relevant_keywords)
 
     if relevant_sources and source_match:
-        return True
+        return 1.0
     if relevant_titles and title_match:
-        return True
+        return 1.0
     if relevant_keywords and keyword_match:
-        return True
+        return 1.0
 
     if relevant_sources and not (relevant_titles or relevant_keywords):
-        return source_match
+        return 1.0 if source_match else 0.0
     if relevant_titles and not (relevant_sources or relevant_keywords):
-        return title_match
+        return 1.0 if title_match else 0.0
     if relevant_keywords and not (relevant_sources or relevant_titles):
-        return keyword_match
+        return 1.0 if keyword_match else 0.0
 
-    return source_match or title_match or keyword_match
+    return 1.0 if source_match or title_match or keyword_match else 0.0
+
+
+def _dcg(relevance_grades: list[float], k: int) -> float:
+    score = 0.0
+    for rank, grade in enumerate(relevance_grades[:k], start=1):
+        score += (2**grade - 1) / math.log2(rank + 1)
+    return score
+
+
+def _ideal_relevance_grades(case: dict) -> list[float]:
+    relevant_scores = case.get("relevant_scores") or {}
+    if relevant_scores:
+        return sorted([float(value) for value in relevant_scores.values()], reverse=True)
+    if case.get("relevant_doc_ids"):
+        return [1.0 for _ in case.get("relevant_doc_ids")]
+    if case.get("relevant_sources") or case.get("relevant_titles") or case.get("relevant_keywords"):
+        return [1.0]
+    return []
+
+
+def _dedup_relevance_grades_for_ndcg(results: list[dict], case: dict) -> list[float]:
+    grades = []
+    seen_doc_ids = set()
+    for item in results:
+        matched_doc_id = _matched_relevant_doc_id(item, case)
+        if matched_doc_id:
+            if matched_doc_id in seen_doc_ids:
+                grades.append(0.0)
+                continue
+            seen_doc_ids.add(matched_doc_id)
+        grades.append(_relevance_grade(item, case))
+    return grades
 
 
 def evaluate_retrieval_cases(
@@ -153,6 +230,7 @@ def evaluate_retrieval_cases(
     llm_generator=None,
     top_k: int = 5,
     low_quality_mrr_threshold: float = 0.5,
+    progress_callback=None,
 ) -> dict[str, Any]:
     k_values = [1, 3, 5]
     top_k = max(1, int(top_k or 5))
@@ -161,13 +239,15 @@ def evaluate_retrieval_cases(
         k_values = sorted(set(k_values))
 
     per_case = []
-    recall_hits = {k: 0 for k in k_values}
+    recall_sums = {k: 0.0 for k in k_values}
+    ndcg_sums = {k: 0.0 for k in k_values}
     reciprocal_rank_sum = 0.0
 
-    for case in cases:
+    valid_cases = [case for case in cases if (case.get("query") or "").strip()]
+    total_cases = len(valid_cases)
+
+    for case_index, case in enumerate(valid_cases, start=1):
         query = (case.get("query") or "").strip()
-        if not query:
-            continue
 
         rewrite_payload = rewrite_query(
             query,
@@ -221,22 +301,35 @@ def evaluate_retrieval_cases(
         sliced = retrieved_results[:top_k]
 
         first_hit_rank = None
+        relevance_grades = []
+        matched_doc_ids_by_rank = []
         for index, item in enumerate(sliced, start=1):
-            if _is_relevant(item, case):
+            relevance_grade = _relevance_grade(item, case)
+            relevance_grades.append(relevance_grade)
+            matched_doc_ids_by_rank.append(_matched_relevant_doc_id(item, case))
+            if relevance_grade > 0 and first_hit_rank is None:
                 first_hit_rank = index
-                break
+        ndcg_relevance_grades = _dedup_relevance_grades_for_ndcg(sliced, case)
 
         reciprocal_rank = 0.0 if first_hit_rank is None else 1.0 / float(first_hit_rank)
         reciprocal_rank_sum += reciprocal_rank
 
         for k in k_values:
-            if first_hit_rank is not None and first_hit_rank <= k:
-                recall_hits[k] += 1
+            if case.get("relevant_doc_ids"):
+                matched = {doc_id for doc_id in matched_doc_ids_by_rank[:k] if doc_id}
+                relevant_total = max(1, len(set(str(item) for item in case.get("relevant_doc_ids") or [])))
+                recall_sums[k] += len(matched) / relevant_total
+            elif first_hit_rank is not None and first_hit_rank <= k:
+                recall_sums[k] += 1.0
+            ideal = _ideal_relevance_grades(case)
+            ideal_dcg = _dcg(ideal, k)
+            ndcg_sums[k] += 0.0 if ideal_dcg <= 0 else min(1.0, _dcg(ndcg_relevance_grades, k) / ideal_dcg)
 
         top_results = [
             {
                 "rank": rank,
                 "score": item.get("score", 0.0),
+                "relevance_grade": _relevance_grade(item, case),
                 "source": (item.get("metadata") or {}).get("source", ""),
                 "document_title": (item.get("metadata") or {}).get("document_title", ""),
                 "section_title": (item.get("metadata") or {}).get("section_title", ""),
@@ -256,11 +349,22 @@ def evaluate_retrieval_cases(
                 "expanded_queries": expanded_payload.get("queries") or [query],
                 "first_hit_rank": first_hit_rank,
                 "reciprocal_rank": reciprocal_rank,
+                "ndcg_at": {
+                    f"{k}": round(
+                        0.0
+                        if _dcg(_ideal_relevance_grades(case), k) <= 0
+                        else min(1.0, _dcg(ndcg_relevance_grades, k) / _dcg(_ideal_relevance_grades(case), k)),
+                        4,
+                    )
+                    for k in k_values
+                },
                 "hit_at": {f"{k}": bool(first_hit_rank is not None and first_hit_rank <= k) for k in k_values},
                 "top_results": top_results,
                 "retrieval_debug": retrieval_debug,
             }
         )
+        if progress_callback:
+            progress_callback(case_index, total_cases, query)
 
     case_count = len(per_case)
     if case_count == 0:
@@ -269,6 +373,7 @@ def evaluate_retrieval_cases(
             "metrics": {
                 "mrr": 0.0,
                 "recall_at": {},
+                "ndcg_at": {},
                 "buckets": {},
                 "top_k": top_k,
                 "low_quality_mrr_threshold": low_quality_mrr_threshold,
@@ -277,20 +382,26 @@ def evaluate_retrieval_cases(
             "cases": [],
         }
 
-    recall_at = {f"{k}": round(recall_hits[k] / case_count, 4) for k in k_values}
+    recall_at = {f"{k}": round(recall_sums[k] / case_count, 4) for k in k_values}
+    ndcg_at = {f"{k}": round(ndcg_sums[k] / case_count, 4) for k in k_values}
     mrr = round(reciprocal_rank_sum / case_count, 4)
     buckets: dict[str, dict[str, Any]] = {}
     for case in per_case:
         question_type = case.get("question_type") or "unknown"
-        bucket = buckets.setdefault(question_type, {"case_count": 0, "reciprocal_rank_sum": 0.0, "recall_at_1_hits": 0})
+        bucket = buckets.setdefault(
+            question_type,
+            {"case_count": 0, "reciprocal_rank_sum": 0.0, "recall_at_1_hits": 0, "ndcg_at_5_sum": 0.0},
+        )
         bucket["case_count"] += 1
         bucket["reciprocal_rank_sum"] += case["reciprocal_rank"]
+        bucket["ndcg_at_5_sum"] += (case.get("ndcg_at") or {}).get("5", 0.0)
         if case["first_hit_rank"] is not None and case["first_hit_rank"] <= 1:
             bucket["recall_at_1_hits"] += 1
     for bucket in buckets.values():
         count = max(1, bucket["case_count"])
         bucket["mrr"] = round(bucket.pop("reciprocal_rank_sum") / count, 4)
         bucket["recall_at_1"] = round(bucket.pop("recall_at_1_hits") / count, 4)
+        bucket["ndcg_at_5"] = round(bucket.pop("ndcg_at_5_sum") / count, 4)
 
     low_quality_cases = []
     for case in per_case:
@@ -322,6 +433,7 @@ def evaluate_retrieval_cases(
         "metrics": {
             "mrr": mrr,
             "recall_at": recall_at,
+            "ndcg_at": ndcg_at,
             "buckets": buckets,
             "top_k": top_k,
             "low_quality_mrr_threshold": low_quality_mrr_threshold,

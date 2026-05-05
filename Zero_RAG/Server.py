@@ -3,7 +3,9 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -103,6 +105,109 @@ llm_generator = LLMGenerator(
     base_url=os.getenv("BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
 )
 
+IMPORT_JOBS: dict[str, dict] = {}
+IMPORT_JOBS_LOCK = threading.Lock()
+RAG_EVAL_JOBS: dict[str, dict] = {}
+RAG_EVAL_JOBS_LOCK = threading.Lock()
+RAG_EVAL_LOG_DIR = ROOT_DIR / "logs" / "rag_eval"
+RAG_EVAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _create_import_job(*, session_id: int, user_id: str, auto_create: bool, total_files: int) -> dict:
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "pending",
+        "message": "等待导入任务开始。",
+        "progress": 0,
+        "session_id": session_id,
+        "user_id": user_id,
+        "auto_create": auto_create,
+        "total_files": total_files,
+        "processed_files": 0,
+        "current_file": "",
+        "total_chunks": 0,
+        "processed_chunks": 0,
+        "result": None,
+        "error": None,
+        "created_at": _now_ms(),
+        "updated_at": _now_ms(),
+    }
+    with IMPORT_JOBS_LOCK:
+        IMPORT_JOBS[job_id] = job
+    return job
+
+
+def _get_import_job(job_id: str) -> dict | None:
+    with IMPORT_JOBS_LOCK:
+        job = IMPORT_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def _update_import_job(job_id: str, **updates):
+    with IMPORT_JOBS_LOCK:
+        job = IMPORT_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = _now_ms()
+
+
+def _chunk_progress(processed_chunks: int, total_chunks: int) -> int:
+    if total_chunks <= 0:
+        return 35
+    return min(88, 35 + int((processed_chunks / total_chunks) * 53))
+
+
+def _create_rag_eval_job(*, session_id: int, user_id: str, total_cases: int) -> dict:
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "pending",
+        "message": "等待 RAG 评测任务开始。",
+        "progress": 0,
+        "session_id": session_id,
+        "user_id": user_id,
+        "total_cases": total_cases,
+        "processed_cases": 0,
+        "current_query": "",
+        "result": None,
+        "error": None,
+        "log_path": "",
+        "created_at": _now_ms(),
+        "updated_at": _now_ms(),
+    }
+    with RAG_EVAL_JOBS_LOCK:
+        RAG_EVAL_JOBS[job_id] = job
+    return job
+
+
+def _get_rag_eval_job(job_id: str) -> dict | None:
+    with RAG_EVAL_JOBS_LOCK:
+        job = RAG_EVAL_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def _update_rag_eval_job(job_id: str, **updates):
+    with RAG_EVAL_JOBS_LOCK:
+        job = RAG_EVAL_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = _now_ms()
+
+
+def _rag_eval_progress(processed_cases: int, total_cases: int) -> int:
+    if total_cases <= 0:
+        return 10
+    return min(95, 10 + int((processed_cases / total_cases) * 85))
+
 
 class SessionCreateRequest(BaseModel):
     user_id: str
@@ -130,6 +235,10 @@ class RetrievalEvalRequest(BaseModel):
     cases: list[RetrievalEvalCase] = []
     top_k: int = 5
     low_quality_mrr_threshold: float = 0.5
+
+
+class BenchmarkImportRequest(BaseModel):
+    user_id: str
 
 
 class WebpageImportRequest(BaseModel):
@@ -200,10 +309,22 @@ def _ingest_text_resource(
     text: str,
     source_type: str,
     metadata: dict | None = None,
+    import_job_id: str | None = None,
+    skip_learning_artifacts: bool = False,
 ):
     normalized_text = text.strip()
     if not normalized_text:
         raise HTTPException(status_code=400, detail=f"Resource {title} does not contain readable text.")
+
+    if import_job_id:
+        _update_import_job(
+            import_job_id,
+            status="running",
+            stage="splitting",
+            message=f"正在切分 {file_name}。",
+            current_file=file_name,
+            progress=25,
+        )
 
     content_hash = calculate_content_hash(normalized_text)
     document_id = create_document(
@@ -234,6 +355,16 @@ def _ingest_text_resource(
             }
         ]
 
+    if import_job_id:
+        _update_import_job(
+            import_job_id,
+            stage="indexing",
+            message=f"正在向量化并写入 {len(chunk_records)} 个 chunk。",
+            total_chunks=len(chunk_records),
+            processed_chunks=0,
+            progress=35,
+        )
+
     source_reference = (metadata or {}).get("source_url") or (metadata or {}).get("source") or file_path
     metadatas = []
     ids = []
@@ -254,7 +385,26 @@ def _ingest_text_resource(
         ids.append(f"session_{session_id}_doc_{document_id}_chunk_{chunk_index}")
 
     chunks = [item["text"] for item in chunk_records]
-    vector_store.add_documents(documents=chunks, metadatas=metadatas, ids=ids)
+
+    def update_vector_progress(processed_chunks: int, total_chunks: int):
+        if import_job_id:
+            _update_import_job(
+                import_job_id,
+                stage="indexing",
+                message=f"已入库 {processed_chunks}/{total_chunks} 个 chunk。",
+                processed_chunks=processed_chunks,
+                total_chunks=total_chunks,
+                progress=_chunk_progress(processed_chunks, total_chunks),
+            )
+
+    vector_store.add_documents(documents=chunks, metadatas=metadatas, ids=ids, progress_callback=update_vector_progress)
+    if import_job_id:
+        _update_import_job(
+            import_job_id,
+            stage="saving_chunks",
+            message="正在保存 chunk 元数据。",
+            progress=90,
+        )
     save_document_chunks(
         document_id=document_id,
         chunks=chunks,
@@ -267,23 +417,45 @@ def _ingest_text_resource(
         },
     )
 
-    summary_bundle = summarize_text(normalized_text, llm_generator=llm_generator)
-    save_document_summary(document_id, "short_summary", summary_bundle["short_summary"])
-    save_document_summary(document_id, "keywords", ", ".join(summary_bundle["keywords"]))
-    save_document_summary(
-        document_id,
-        "interview_takeaways",
-        "\n".join(summary_bundle["interview_takeaways"]),
-    )
+    if import_job_id and not skip_learning_artifacts:
+        _update_import_job(
+            import_job_id,
+            stage="summarizing",
+            message="正在生成摘要和知识点。",
+            progress=93,
+        )
+    if skip_learning_artifacts:
+        summary_bundle = {
+            "short_summary": "Benchmark corpus imported without learning summary generation.",
+            "keywords": [],
+            "interview_takeaways": [],
+            "knowledge_points": [],
+        }
+    else:
+        summary_bundle = summarize_text(normalized_text, llm_generator=llm_generator)
+        save_document_summary(document_id, "short_summary", summary_bundle["short_summary"])
+        save_document_summary(document_id, "keywords", ", ".join(summary_bundle["keywords"]))
+        save_document_summary(
+            document_id,
+            "interview_takeaways",
+            "\n".join(summary_bundle["interview_takeaways"]),
+        )
 
-    knowledge_point_ids = save_knowledge_points(session_id, document_id, summary_bundle["knowledge_points"])
-    create_review_items_from_knowledge_points(
-        user_id=user_id,
-        session_id=session_id,
-        knowledge_points=summary_bundle["knowledge_points"],
-        knowledge_point_ids=knowledge_point_ids,
-    )
+        knowledge_point_ids = save_knowledge_points(session_id, document_id, summary_bundle["knowledge_points"])
+        create_review_items_from_knowledge_points(
+            user_id=user_id,
+            session_id=session_id,
+            knowledge_points=summary_bundle["knowledge_points"],
+            knowledge_point_ids=knowledge_point_ids,
+        )
 
+    if import_job_id:
+        _update_import_job(
+            import_job_id,
+            stage="finalizing_document",
+            message=f"{file_name} 已完成入库。",
+            progress=96,
+        )
     mark_document_ingested(document_id=document_id, status="completed")
     return (
         {
@@ -326,7 +498,7 @@ def _refresh_session_metadata(session_id: int, file_names: list[str], merged_tex
     )
 
 
-async def _ingest_documents_for_session(session_id: int, user_id: str, files: list[UploadFile]):
+async def _ingest_documents_for_session(session_id: int, user_id: str, files: list[UploadFile], import_job_id: str | None = None):
     session = get_study_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Study session not found.")
@@ -340,6 +512,15 @@ async def _ingest_documents_for_session(session_id: int, user_id: str, files: li
 
     for upload in files:
         file_path = session_dir / upload.filename
+        if import_job_id:
+            _update_import_job(
+                import_job_id,
+                status="running",
+                stage="reading",
+                message=f"正在读取 {upload.filename}。",
+                current_file=upload.filename,
+                progress=10,
+            )
         file_bytes = await upload.read()
         file_path.write_bytes(file_bytes)
 
@@ -360,13 +541,473 @@ async def _ingest_documents_for_session(session_id: int, user_id: str, files: li
             text=text,
             source_type="upload",
             metadata={"source": str(file_path)},
+            import_job_id=import_job_id,
         )
         created_documents.append(created_document)
         file_names.append(display_name)
         merged_text_parts.append(preview_text)
 
+    if import_job_id:
+        _update_import_job(
+            import_job_id,
+            stage="session_metadata",
+            message="正在刷新会话名称、主题和目标。",
+            progress=97,
+        )
     updated_session = _refresh_session_metadata(session_id, file_names, merged_text_parts)
     return {"session": updated_session, "documents": created_documents}
+
+
+def _ingest_saved_documents_for_session(session_id: int, user_id: str, file_records: list[dict], import_job_id: str):
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+
+    created_documents = []
+    file_names = []
+    merged_text_parts = []
+
+    for file_index, record in enumerate(file_records, start=1):
+        file_path = Path(record["path"])
+        file_name = record["filename"]
+        _update_import_job(
+            import_job_id,
+            status="running",
+            stage="reading",
+            message=f"正在读取 {file_name}。",
+            current_file=file_name,
+            processed_files=file_index - 1,
+            progress=10,
+        )
+
+        try:
+            loader = DocumentLoader(str(file_path))
+            text = loader.load().strip()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to read {file_name}: {exc}")
+
+        created_document, display_name, preview_text = _ingest_text_resource(
+            session_id=session_id,
+            user_id=user_id,
+            title=Path(file_name).stem,
+            file_name=file_name,
+            file_path=str(file_path),
+            file_type=file_path.suffix.lower(),
+            file_size=int(record.get("size") or file_path.stat().st_size),
+            text=text,
+            source_type="upload",
+            metadata={"source": str(file_path)},
+            import_job_id=import_job_id,
+        )
+        created_documents.append(created_document)
+        file_names.append(display_name)
+        merged_text_parts.append(preview_text)
+        _update_import_job(import_job_id, processed_files=file_index)
+
+    _update_import_job(
+        import_job_id,
+        stage="session_metadata",
+        message="正在刷新会话名称、主题和目标。",
+        progress=97,
+    )
+    updated_session = _refresh_session_metadata(session_id, file_names, merged_text_parts)
+    return {"session": updated_session, "documents": created_documents}
+
+
+def _run_import_job(job_id: str, *, session_id: int, user_id: str, file_records: list[dict]):
+    started = time.perf_counter()
+    try:
+        _update_import_job(job_id, status="running", stage="starting", message="导入任务已启动。", progress=5)
+        result = _ingest_saved_documents_for_session(
+            session_id=session_id,
+            user_id=user_id,
+            file_records=file_records,
+            import_job_id=job_id,
+        )
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _update_import_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message="导入完成。",
+            progress=100,
+            result={"session_id": session_id, "session": result["session"], "documents": result["documents"]},
+        )
+        _record_event_safe(
+            "documents.import_job",
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id, "document_count": len(result["documents"])},
+        )
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _update_import_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="导入失败。",
+            error=str(exc.detail if isinstance(exc, HTTPException) else exc),
+        )
+        _record_event_safe(
+            "documents.import_job",
+            status="error",
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id},
+            message=str(exc),
+        )
+
+
+def _run_scifact_import_job(job_id: str, *, session_id: int, user_id: str, corpus_path: Path):
+    started = time.perf_counter()
+    try:
+        _update_import_job(
+            job_id,
+            status="running",
+            stage="reading",
+            message="正在读取 SciFact benchmark corpus。",
+            current_file=corpus_path.name,
+            progress=10,
+        )
+        text = corpus_path.read_text(encoding="utf-8").strip()
+        created_document, _, _ = _ingest_text_resource(
+            session_id=session_id,
+            user_id=user_id,
+            title="SciFact Benchmark Corpus",
+            file_name=corpus_path.name,
+            file_path=str(corpus_path),
+            file_type=corpus_path.suffix.lower(),
+            file_size=corpus_path.stat().st_size,
+            text=text,
+            source_type="benchmark",
+            metadata={
+                "source": "scifact_benchmark",
+                "dataset": "scifact",
+                "benchmark_path": str(corpus_path),
+            },
+            import_job_id=job_id,
+            skip_learning_artifacts=True,
+        )
+        session = get_study_session(session_id)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _update_import_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message="SciFact benchmark 语料导入完成。",
+            processed_files=1,
+            progress=100,
+            result={"session_id": session_id, "session": session, "documents": [created_document]},
+        )
+        _record_event_safe(
+            "benchmark.scifact.import_job",
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id, "document_id": created_document["document_id"]},
+        )
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _update_import_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="SciFact benchmark 导入失败。",
+            error=str(exc.detail if isinstance(exc, HTTPException) else exc),
+        )
+        _record_event_safe(
+            "benchmark.scifact.import_job",
+            status="error",
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id},
+            message=str(exc),
+        )
+
+
+def _run_t2retrieval_import_job(job_id: str, *, session_id: int, user_id: str, corpus_path: Path):
+    started = time.perf_counter()
+    try:
+        _update_import_job(
+            job_id,
+            status="running",
+            stage="reading",
+            message="正在读取 T2Retrieval 中文 benchmark corpus。",
+            current_file=corpus_path.name,
+            progress=10,
+        )
+        text = corpus_path.read_text(encoding="utf-8").strip()
+        created_document, _, _ = _ingest_text_resource(
+            session_id=session_id,
+            user_id=user_id,
+            title="T2Retrieval Chinese Benchmark Corpus",
+            file_name=corpus_path.name,
+            file_path=str(corpus_path),
+            file_type=corpus_path.suffix.lower(),
+            file_size=corpus_path.stat().st_size,
+            text=text,
+            source_type="benchmark",
+            metadata={
+                "source": "t2retrieval_benchmark",
+                "dataset": "t2retrieval",
+                "benchmark_path": str(corpus_path),
+            },
+            import_job_id=job_id,
+            skip_learning_artifacts=True,
+        )
+        session = get_study_session(session_id)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _update_import_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message="T2Retrieval 中文 benchmark 语料导入完成。",
+            processed_files=1,
+            progress=100,
+            result={"session_id": session_id, "session": session, "documents": [created_document]},
+        )
+        _record_event_safe(
+            "benchmark.t2retrieval.import_job",
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id, "document_id": created_document["document_id"]},
+        )
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _update_import_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="T2Retrieval 中文 benchmark 导入失败。",
+            error=str(exc.detail if isinstance(exc, HTTPException) else exc),
+        )
+        _record_event_safe(
+            "benchmark.t2retrieval.import_job",
+            status="error",
+            session_id=session_id,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id},
+            message=str(exc),
+        )
+
+
+def _build_rag_eval_cases_for_request(session_id: int, request: RetrievalEvalRequest) -> tuple[dict, list[dict], list[dict], list[dict]]:
+    session = get_study_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    documents = get_session_documents(session_id)
+    knowledge_points = get_session_knowledge_points(session_id)
+    eval_cases = [item.model_dump() if hasattr(item, "model_dump") else dict(item) for item in request.cases]
+    if not eval_cases:
+        eval_cases = build_session_eval_cases(
+            session,
+            documents,
+            knowledge_points,
+            limit=8,
+            include_template_cases=True,
+        )
+    if not eval_cases:
+        raise HTTPException(status_code=400, detail="No RAG evaluation cases are available for this session.")
+    return session, documents, knowledge_points, eval_cases
+
+
+def _write_rag_eval_log(
+    *,
+    job_id: str | None,
+    session_id: int,
+    user_id: str,
+    request: RetrievalEvalRequest,
+    payload: dict,
+    run_id: int | None,
+    duration_ms: int,
+) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    safe_job_id = job_id or "sync"
+    log_path = RAG_EVAL_LOG_DIR / f"session_{session_id}_{timestamp}_{safe_job_id}.json"
+    metrics = payload.get("metrics", {})
+    low_quality_cases = payload.get("low_quality_cases", [])
+    log_payload = {
+        "log_type": "rag_retrieval_evaluation",
+        "generated_at": timestamp,
+        "job_id": job_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "user_id": user_id,
+        "request": {
+            "top_k": request.top_k,
+            "low_quality_mrr_threshold": request.low_quality_mrr_threshold,
+            "case_count": payload.get("case_count", 0),
+        },
+        "metrics": metrics,
+        "low_quality_cases": low_quality_cases,
+        "cases": payload.get("cases", []),
+        "duration_ms": duration_ms,
+        "llm_analysis_prompt": (
+            "请分析这次 RAG 检索评测结果。重点判断：1. 召回质量是否达标；"
+            "2. 低质量 query 的主要失败原因；3. Query Rewrite、Multi-Query、Rerank、Parent 回填中哪一环最可能需要优化；"
+            "4. 给出下一轮可执行的 RAG 调优建议。"
+        ),
+    }
+    log_path.write_text(json.dumps(log_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(log_path)
+
+
+def _run_rag_eval_job(job_id: str, *, session_id: int, request_payload: dict):
+    started = time.perf_counter()
+    run_id = None
+    request = RetrievalEvalRequest(**request_payload)
+    try:
+        retriever, doc_chunks = _build_session_retriever(session_id)
+        if not retriever or not doc_chunks:
+            raise HTTPException(status_code=400, detail="No indexed study materials were found for this session.")
+
+        session, documents, knowledge_points, eval_cases = _build_rag_eval_cases_for_request(session_id, request)
+        _update_rag_eval_job(
+            job_id,
+            status="running",
+            stage="starting",
+            message=f"准备评测 {len(eval_cases)} 条 query。",
+            total_cases=len(eval_cases),
+            progress=5,
+        )
+
+        run_id = create_run(
+            run_type="rag.evaluate",
+            session_id=session_id,
+            user_id=request.user_id,
+            title="RAG 检索评测",
+            input_summary=f"case_count={len(eval_cases)}",
+            metadata={"top_k": request.top_k, "threshold": request.low_quality_mrr_threshold, "job_id": job_id},
+        )
+
+        def update_eval_progress(done: int, total: int, query: str):
+            _update_rag_eval_job(
+                job_id,
+                status="running",
+                stage="retrieving",
+                message=f"正在评测 {done}/{total} 条 query。",
+                processed_cases=done,
+                total_cases=total,
+                current_query=query[:180],
+                progress=_rag_eval_progress(done, total),
+            )
+
+        payload = evaluate_retrieval_cases(
+            retriever,
+            eval_cases,
+            rewrite_query=rewrite_query,
+            expand_query_to_multi_queries=expand_query_to_multi_queries,
+            plan_retrieval_route=plan_retrieval_route,
+            session_context=_build_session_context_text(session_id),
+            llm_generator=llm_generator,
+            top_k=request.top_k,
+            low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+            progress_callback=update_eval_progress,
+        )
+        low_quality_sample_count = save_low_quality_samples(
+            session_id=session_id,
+            user_id=request.user_id,
+            low_quality_cases=payload.get("low_quality_cases", []),
+            metrics=payload.get("metrics", {}),
+            source_run_id=run_id,
+        )
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        log_path = _write_rag_eval_log(
+            job_id=job_id,
+            session_id=session_id,
+            user_id=request.user_id,
+            request=request,
+            payload=payload,
+            run_id=run_id,
+            duration_ms=duration_ms,
+        )
+        payload["log_path"] = log_path
+        _record_run_step_safe(
+            run_id,
+            "rag.evaluate.retrieval",
+            duration_ms=duration_ms,
+            metadata={
+                "case_count": payload.get("case_count", 0),
+                "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "ndcg_at": payload.get("metrics", {}).get("ndcg_at", {}),
+                "buckets": payload.get("metrics", {}).get("buckets", {}),
+                "low_quality_count": len(payload.get("low_quality_cases", [])),
+                "low_quality_sample_count": low_quality_sample_count,
+                "log_path": log_path,
+            },
+        )
+        _finish_run_safe(
+            run_id,
+            status="success",
+            output_summary=f"mrr={payload.get('metrics', {}).get('mrr', 0)}",
+            duration_ms=duration_ms,
+            metadata={
+                "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "ndcg_at": payload.get("metrics", {}).get("ndcg_at", {}),
+                "buckets": payload.get("metrics", {}).get("buckets", {}),
+                "low_quality_count": len(payload.get("low_quality_cases", [])),
+                "low_quality_sample_count": low_quality_sample_count,
+                "log_path": log_path,
+            },
+        )
+        _record_event_safe(
+            "rag.evaluate",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            metadata={
+                "case_count": payload.get("case_count", 0),
+                "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "ndcg_at": payload.get("metrics", {}).get("ndcg_at", {}),
+                "low_quality_count": len(payload.get("low_quality_cases", [])),
+                "low_quality_sample_count": low_quality_sample_count,
+                "log_path": log_path,
+                "job_id": job_id,
+            },
+        )
+        _update_rag_eval_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message="RAG 评测完成。",
+            progress=100,
+            result={"session_id": session_id, **payload},
+            log_path=log_path,
+        )
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if run_id is not None:
+            _record_run_step_safe(
+                run_id,
+                "rag.evaluate.error",
+                step_status="error",
+                duration_ms=duration_ms,
+                message=str(exc),
+            )
+            _finish_run_safe(run_id, status="error", output_summary=str(exc), duration_ms=duration_ms)
+        _record_event_safe(
+            "rag.evaluate",
+            status="error",
+            session_id=session_id,
+            user_id=request.user_id,
+            duration_ms=duration_ms,
+            metadata={"job_id": job_id},
+            message=str(exc),
+        )
+        _update_rag_eval_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="RAG 评测失败。",
+            error=str(exc.detail if isinstance(exc, HTTPException) else exc),
+        )
 
 
 def _ingest_webpage_for_session(session_id: int, user_id: str, url: str):
@@ -965,6 +1606,188 @@ async def get_rag_eval_cases_endpoint(session_id: int, limit: int = Query(8)):
     return {"session_id": session_id, "case_count": len(cases), "cases": cases}
 
 
+# @app.get("/rag/benchmarks/scifact")
+# async def get_scifact_benchmark_cases_endpoint(limit: int = Query(300)):
+#     benchmark_path = ROOT_DIR / "benchmarks" / "scifact" / "scifact_test_eval_cases.json"
+#     if not benchmark_path.exists():
+#         raise HTTPException(
+#             status_code=404,
+#             detail="SciFact benchmark cases were not found. Run tools/prepare_scifact_benchmark.py first.",
+#         )
+#     try:
+#         cases = json.loads(benchmark_path.read_text(encoding="utf-8"))
+#     except Exception as exc:
+#         raise HTTPException(status_code=500, detail=f"Failed to load SciFact benchmark cases: {exc}")
+#     cases = [item for item in cases if isinstance(item, dict) and item.get("query")]
+#     cases = cases[: max(1, int(limit or 300))]
+#     return {
+#         "dataset": "scifact",
+#         "case_count": len(cases),
+#         "cases": cases,
+#         "source_path": str(benchmark_path),
+#     }
+
+
+# 强制切片为前 10 条，忽略传入的 limit 参数，以确保评测的一致性和可控性
+@app.get("/rag/benchmarks/scifact")
+async def get_scifact_benchmark_cases_endpoint(limit: int = Query(10)):
+    benchmark_path = ROOT_DIR / "benchmarks" / "scifact" / "scifact_test_eval_cases.json"
+    if not benchmark_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="SciFact benchmark cases were not found. Run tools/prepare_scifact_benchmark.py first.",
+        )
+    try:
+        cases = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load SciFact benchmark cases: {exc}")
+    cases = [item for item in cases if isinstance(item, dict) and item.get("query")]
+
+    # 强制切片为前 10 条，忽略传入的 limit
+    cases = cases[:10]
+
+    return {
+        "dataset": "scifact",
+        "case_count": len(cases),
+        "cases": cases,
+        "source_path": str(benchmark_path),
+    }
+
+
+@app.post("/benchmarks/scifact/import_jobs")
+async def start_scifact_benchmark_import_job_endpoint(request: BenchmarkImportRequest):
+    corpus_path = ROOT_DIR / "benchmarks" / "scifact" / "scifact_corpus.md"
+    if not corpus_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="SciFact benchmark corpus was not found. Run tools/prepare_scifact_benchmark.py first.",
+        )
+
+    session = create_study_session(
+        user_id=request.user_id,
+        session_name="SciFact Benchmark",
+        topic="Biomedical claim verification",
+        goal="Run fixed RAG retrieval benchmark with BEIR SciFact.",
+        tags=["benchmark", "scifact", "rag_eval"],
+    )
+
+    job = _create_import_job(
+        session_id=session["id"],
+        user_id=request.user_id,
+        auto_create=True,
+        total_files=1,
+    )
+    _update_import_job(
+        job["job_id"],
+        stage="starting",
+        message="正在启动 SciFact benchmark 专用导入任务。",
+        current_file=corpus_path.name,
+        progress=3,
+    )
+    thread = threading.Thread(
+        target=_run_scifact_import_job,
+        kwargs={
+            "job_id": job["job_id"],
+            "session_id": session["id"],
+            "user_id": request.user_id,
+            "corpus_path": corpus_path,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job["job_id"], "session_id": session["id"], "session": session}
+
+
+@app.get("/rag/benchmarks/t2retrieval")
+async def get_t2retrieval_benchmark_cases_endpoint(limit: int = Query(50)):
+    benchmark_path = ROOT_DIR / "benchmarks" / "t2retrieval" / "t2retrieval_dev_eval_cases.json"
+    if not benchmark_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="T2Retrieval benchmark cases were not found. Run tools/prepare_t2retrieval_benchmark.py first.",
+        )
+    try:
+        cases = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load T2Retrieval benchmark cases: {exc}")
+    cases = [item for item in cases if isinstance(item, dict) and item.get("query")]
+    cases = cases[: max(1, int(limit or 50))]
+    return {
+        "dataset": "t2retrieval",
+        "case_count": len(cases),
+        "cases": cases,
+        "source_path": str(benchmark_path),
+    }
+
+
+@app.post("/benchmarks/t2retrieval/import_jobs")
+async def start_t2retrieval_benchmark_import_job_endpoint(request: BenchmarkImportRequest):
+    corpus_path = ROOT_DIR / "benchmarks" / "t2retrieval" / "t2retrieval_corpus.md"
+    if not corpus_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="T2Retrieval benchmark corpus was not found. Run tools/prepare_t2retrieval_benchmark.py first.",
+        )
+
+    session = create_study_session(
+        user_id=request.user_id,
+        session_name="T2Retrieval 中文 Benchmark",
+        topic="中文文本检索评测",
+        goal="使用 mteb/T2Retrieval 运行中文 RAG 检索 benchmark。",
+        tags=["benchmark", "t2retrieval", "chinese", "rag_eval"],
+    )
+
+    job = _create_import_job(
+        session_id=session["id"],
+        user_id=request.user_id,
+        auto_create=True,
+        total_files=1,
+    )
+    _update_import_job(
+        job["job_id"],
+        stage="starting",
+        message="正在启动 T2Retrieval 中文 benchmark 专用导入任务。",
+        current_file=corpus_path.name,
+        progress=3,
+    )
+    thread = threading.Thread(
+        target=_run_t2retrieval_import_job,
+        kwargs={
+            "job_id": job["job_id"],
+            "session_id": session["id"],
+            "user_id": request.user_id,
+            "corpus_path": corpus_path,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job["job_id"], "session_id": session["id"], "session": session}
+
+
+@app.get("/rag/eval_jobs/{job_id}")
+async def get_rag_eval_job_endpoint(job_id: str):
+    job = _get_rag_eval_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="RAG evaluation job not found.")
+    return job
+
+
+@app.post("/study_sessions/{session_id}/rag/evaluate_jobs")
+async def start_rag_evaluation_job_endpoint(session_id: int, request: RetrievalEvalRequest):
+    if not get_study_session(session_id):
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    request_cases = [item.model_dump() for item in request.cases]
+    total_cases = len(request_cases) if request_cases else 0
+    job = _create_rag_eval_job(session_id=session_id, user_id=request.user_id, total_cases=total_cases)
+    thread = threading.Thread(
+        target=_run_rag_eval_job,
+        kwargs={"job_id": job["job_id"], "session_id": session_id, "request_payload": request.model_dump()},
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job["job_id"], "session_id": session_id}
+
+
 @app.post("/study_sessions/{session_id}/rag/evaluate")
 async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEvalRequest):
     started = time.perf_counter()
@@ -1016,6 +1839,16 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             source_run_id=run_id,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
+        log_path = _write_rag_eval_log(
+            job_id=None,
+            session_id=session_id,
+            user_id=request.user_id,
+            request=request,
+            payload=payload,
+            run_id=run_id,
+            duration_ms=duration_ms,
+        )
+        payload["log_path"] = log_path
         _record_run_step_safe(
             run_id,
             "rag.evaluate.retrieval",
@@ -1024,9 +1857,11 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
                 "case_count": payload.get("case_count", 0),
                 "mrr": payload.get("metrics", {}).get("mrr", 0),
                 "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "ndcg_at": payload.get("metrics", {}).get("ndcg_at", {}),
                 "buckets": payload.get("metrics", {}).get("buckets", {}),
                 "low_quality_count": len(payload.get("low_quality_cases", [])),
                 "low_quality_sample_count": low_quality_sample_count,
+                "log_path": log_path,
             },
         )
         _finish_run_safe(
@@ -1037,9 +1872,11 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             metadata={
                 "mrr": payload.get("metrics", {}).get("mrr", 0),
                 "recall_at": payload.get("metrics", {}).get("recall_at", {}),
+                "ndcg_at": payload.get("metrics", {}).get("ndcg_at", {}),
                 "buckets": payload.get("metrics", {}).get("buckets", {}),
                 "low_quality_count": len(payload.get("low_quality_cases", [])),
                 "low_quality_sample_count": low_quality_sample_count,
+                "log_path": log_path,
             },
         )
         _record_event_safe(
@@ -1050,9 +1887,11 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             metadata={
                 "case_count": payload.get("case_count", 0),
                 "mrr": payload.get("metrics", {}).get("mrr", 0),
+                "ndcg_at": payload.get("metrics", {}).get("ndcg_at", {}),
                 "buckets": payload.get("metrics", {}).get("buckets", {}),
                 "low_quality_count": len(payload.get("low_quality_cases", [])),
                 "low_quality_sample_count": low_quality_sample_count,
+                "log_path": log_path,
             },
         )
         return {"session_id": session_id, **payload}
@@ -1218,6 +2057,56 @@ async def upload_documents_endpoint(
     return {"session_id": session_id, "session": result["session"], "documents": result["documents"]}
 
 
+async def _save_import_job_uploads(job_id: str, files: list[UploadFile]) -> list[dict]:
+    job_dir = UPLOAD_DIR / "import_jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    file_records = []
+    for upload in files:
+        safe_name = Path(upload.filename).name
+        file_path = job_dir / safe_name
+        file_bytes = await upload.read()
+        file_path.write_bytes(file_bytes)
+        file_records.append({"filename": safe_name, "path": str(file_path), "size": len(file_bytes)})
+    return file_records
+
+
+def _start_import_job_thread(job_id: str, *, session_id: int, user_id: str, file_records: list[dict]):
+    thread = threading.Thread(
+        target=_run_import_job,
+        kwargs={
+            "job_id": job_id,
+            "session_id": session_id,
+            "user_id": user_id,
+            "file_records": file_records,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+
+@app.get("/import_jobs/{job_id}")
+async def get_import_job_endpoint(job_id: str):
+    job = _get_import_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import job not found.")
+    return job
+
+
+@app.post("/study_sessions/{session_id}/documents/import_jobs")
+async def start_upload_documents_job_endpoint(
+    session_id: int,
+    user_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    if not get_study_session(session_id):
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    job = _create_import_job(session_id=session_id, user_id=user_id, auto_create=False, total_files=len(files))
+    _update_import_job(job["job_id"], stage="saving_uploads", message="正在保存上传文件。", progress=2)
+    file_records = await _save_import_job_uploads(job["job_id"], files)
+    _start_import_job_thread(job["job_id"], session_id=session_id, user_id=user_id, file_records=file_records)
+    return {"job_id": job["job_id"], "session_id": session_id}
+
+
 @app.post("/study_sessions/auto_from_documents")
 async def auto_create_session_from_documents_endpoint(
     user_id: str = Form(...),
@@ -1240,6 +2129,35 @@ async def auto_create_session_from_documents_endpoint(
         "session": result["session"],
         "documents": result["documents"],
     }
+
+
+@app.post("/study_sessions/auto_from_documents/import_jobs")
+async def start_auto_create_documents_job_endpoint(
+    user_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    placeholder_session = create_study_session(
+        user_id=user_id,
+        session_name="资料整理中",
+        topic="待分析",
+        goal="等待系统根据上传资料自动生成学习信息。",
+        tags=[],
+    )
+    job = _create_import_job(
+        session_id=placeholder_session["id"],
+        user_id=user_id,
+        auto_create=True,
+        total_files=len(files),
+    )
+    _update_import_job(job["job_id"], stage="saving_uploads", message="正在保存上传文件。", progress=2)
+    file_records = await _save_import_job_uploads(job["job_id"], files)
+    _start_import_job_thread(
+        job["job_id"],
+        session_id=placeholder_session["id"],
+        user_id=user_id,
+        file_records=file_records,
+    )
+    return {"job_id": job["job_id"], "session_id": placeholder_session["id"], "session": placeholder_session}
 
 
 @app.post("/study_sessions/{session_id}/webpages")

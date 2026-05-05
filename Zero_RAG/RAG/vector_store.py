@@ -10,7 +10,7 @@ class ChromaDBStore:
         self.embeddings_model = TongyiEmbeddings()
         self.collection = self.client.get_or_create_collection(name=collection_name)
 
-    def add_documents(self, documents: list[str], metadatas: list[dict], ids: list[str]):
+    def add_documents(self, documents: list[str], metadatas: list[dict], ids: list[str], progress_callback=None):
         batch_size = 10
 
         for index in range(0, len(documents), batch_size):
@@ -24,6 +24,8 @@ class ChromaDBStore:
                 metadatas=batch_metas,
                 ids=batch_ids,
             )
+            if progress_callback:
+                progress_callback(min(index + len(batch_docs), len(documents)), len(documents))
 
     def similarity_search(self, query: str, top_k=5, where: dict | None = None) -> list[dict]:
         query_embedding = self.embeddings_model.embed_query(query)

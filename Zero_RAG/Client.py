@@ -1,5 +1,6 @@
 ﻿import json
 import mimetypes
+import time
 from datetime import datetime
 
 import requests
@@ -8,6 +9,9 @@ import streamlit as st
 
 API_BASE_URL = "http://127.0.0.1:8888"
 DEFAULT_USER_ID = "learnos_local_user"
+DEFAULT_IMPORT_TIMEOUT_SECONDS = 180
+LARGE_IMPORT_TIMEOUT_SECONDS = 1800
+LARGE_IMPORT_THRESHOLD_BYTES = 5 * 1024 * 1024
 
 SUMMARY_TYPE_LABELS = {
     "short_summary": "简要摘要",
@@ -156,34 +160,170 @@ def build_file_payload(uploaded_files):
     return files_payload
 
 
-def import_uploaded_files(auto_create: bool, uploaded_files):
-    files_payload = build_file_payload(uploaded_files)
+def get_upload_total_size(uploaded_files) -> int:
+    total_size = 0
+    for file in uploaded_files:
+        if getattr(file, "size", None) is not None:
+            total_size += int(file.size)
+        else:
+            total_size += len(file.getvalue())
+    return total_size
+
+
+def get_import_timeout(uploaded_files) -> int:
+    if get_upload_total_size(uploaded_files) >= LARGE_IMPORT_THRESHOLD_BYTES:
+        return LARGE_IMPORT_TIMEOUT_SECONDS
+    return DEFAULT_IMPORT_TIMEOUT_SECONDS
+
+
+def show_import_timeout_error(timeout_seconds: int):
+    st.error(
+        "导入仍在后端处理中，但前端等待超时了。"
+        f"本次等待上限为 {timeout_seconds} 秒；SciFact 这类大语料切分和向量化会比较慢。"
+        "可以稍等后刷新会话列表，或先用 prepare_scifact_benchmark.py 的 --max-documents 生成小样本做快速验证。"
+    )
+
+
+def _render_import_job_progress(job: dict, progress_bar, status_placeholder, detail_placeholder):
+    progress_bar.progress(max(0, min(100, int(job.get("progress") or 0))))
+    status_placeholder.caption(job.get("message") or "导入任务处理中...")
+
+    details = [
+        f"阶段：{job.get('stage', '-')}",
+        f"文件：{job.get('processed_files', 0)}/{job.get('total_files', 0)}",
+    ]
+    if job.get("current_file"):
+        details.append(f"当前文件：{job.get('current_file')}")
+    if int(job.get("total_chunks") or 0) > 0:
+        details.append(f"chunk：{job.get('processed_chunks', 0)}/{job.get('total_chunks', 0)}")
+    detail_placeholder.caption(" | ".join(details))
+
+
+def poll_import_job(job_id: str, timeout_seconds: int) -> dict | None:
+    status_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    detail_placeholder = st.empty()
+    started = time.monotonic()
+
+    while True:
+        if time.monotonic() - started > timeout_seconds:
+            show_import_timeout_error(timeout_seconds)
+            return None
+
+        response = requests.get(f"{API_BASE_URL}/import_jobs/{job_id}", timeout=20)
+        if not response.ok:
+            st.error(extract_error_message(response))
+            return None
+
+        job = response.json()
+        _render_import_job_progress(job, progress_bar, status_placeholder, detail_placeholder)
+
+        if job.get("status") == "completed":
+            progress_bar.progress(100)
+            return job
+        if job.get("status") == "failed":
+            st.error(job.get("error") or "导入失败。")
+            return None
+
+        time.sleep(1)
+
+
+def start_import_job(auto_create: bool, files_payload: list, timeout_seconds: int) -> dict | None:
     if auto_create:
+        url = f"{API_BASE_URL}/study_sessions/auto_from_documents/import_jobs"
+    else:
+        url = f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/documents/import_jobs"
+
+    try:
         response = requests.post(
-            f"{API_BASE_URL}/study_sessions/auto_from_documents",
+            url,
             data={"user_id": st.session_state["user_id"]},
             files=files_payload,
-            timeout=180,
+            timeout=DEFAULT_IMPORT_TIMEOUT_SECONDS,
         )
-        if response.ok:
-            created = response.json()["session"]
-            select_session(created["id"])
-            st.success("已根据上传资料新建学习会话。")
-        else:
-            st.error(extract_error_message(response))
+    except requests.exceptions.RequestException as exc:
+        st.error(f"导入任务启动失败：{exc}")
+        return None
+
+    if not response.ok:
+        st.error(extract_error_message(response))
+        return None
+
+    return poll_import_job(response.json()["job_id"], timeout_seconds)
+
+
+def import_scifact_benchmark():
+    payload = {"user_id": st.session_state["user_id"]}
+
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/benchmarks/scifact/import_jobs",
+            json=payload,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        st.error(f"SciFact 导入任务启动失败：{exc}")
         return
 
-    response = requests.post(
-        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/documents",
-        data={"user_id": st.session_state["user_id"]},
-        files=files_payload,
-        timeout=180,
-    )
-    if response.ok:
-        load_session_detail(st.session_state["selected_session_id"])
-        st.success("学习资料已导入当前会话。")
-    else:
+    if not response.ok:
         st.error(extract_error_message(response))
+        return
+
+    job_payload = response.json()
+    job = poll_import_job(job_payload["job_id"], LARGE_IMPORT_TIMEOUT_SECONDS)
+    if not job:
+        return
+
+    session_id = (job.get("result") or {}).get("session_id") or job_payload.get("session_id")
+    if session_id:
+        select_session(session_id)
+    st.success("SciFact benchmark 语料已完成专用导入。")
+
+
+def import_t2retrieval_benchmark():
+    payload = {"user_id": st.session_state["user_id"]}
+
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/benchmarks/t2retrieval/import_jobs",
+            json=payload,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        st.error(f"T2Retrieval 中文导入任务启动失败：{exc}")
+        return
+
+    if not response.ok:
+        st.error(extract_error_message(response))
+        return
+
+    job_payload = response.json()
+    job = poll_import_job(job_payload["job_id"], LARGE_IMPORT_TIMEOUT_SECONDS)
+    if not job:
+        return
+
+    session_id = (job.get("result") or {}).get("session_id") or job_payload.get("session_id")
+    if session_id:
+        select_session(session_id)
+    st.success("T2Retrieval 中文 benchmark 语料已完成专用导入。")
+
+
+def import_uploaded_files(auto_create: bool, uploaded_files):
+    files_payload = build_file_payload(uploaded_files)
+    timeout_seconds = get_import_timeout(uploaded_files)
+    job = start_import_job(auto_create, files_payload, timeout_seconds)
+    if not job:
+        return
+
+    if auto_create:
+        result = job.get("result") or {}
+        created = result.get("session") or {"id": job.get("session_id")}
+        select_session(created["id"])
+        st.success("已根据上传资料新建学习会话。")
+        return
+
+    load_session_detail(st.session_state["selected_session_id"])
+    st.success("学习资料已导入当前会话。")
 
 
 def import_webpage(url: str, auto_create: bool):
@@ -604,6 +744,79 @@ def load_rag_eval_cases(limit: int = 8):
         st.error(extract_error_message(response))
 
 
+def load_scifact_eval_cases(limit: int = 300):
+    response = requests.get(
+        f"{API_BASE_URL}/rag/benchmarks/scifact",
+        params={"limit": int(limit)},
+        timeout=30,
+    )
+    if response.ok:
+        payload = response.json()
+        st.session_state["rag_eval_cases"] = payload.get("cases", [])
+        st.session_state["rag_eval_cases_session_id"] = st.session_state["selected_session_id"]
+        st.success(f"已加载 SciFact benchmark：{payload.get('case_count', 0)} 条。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def load_t2retrieval_eval_cases(limit: int = 50):
+    response = requests.get(
+        f"{API_BASE_URL}/rag/benchmarks/t2retrieval",
+        params={"limit": int(limit)},
+        timeout=30,
+    )
+    if response.ok:
+        payload = response.json()
+        st.session_state["rag_eval_cases"] = payload.get("cases", [])
+        st.session_state["rag_eval_cases_session_id"] = st.session_state["selected_session_id"]
+        st.success(f"已加载 T2Retrieval 中文 benchmark：{payload.get('case_count', 0)} 条。")
+    else:
+        st.error(extract_error_message(response))
+
+
+def _render_rag_eval_job_progress(job: dict, progress_bar, status_placeholder, detail_placeholder):
+    progress_bar.progress(max(0, min(100, int(job.get("progress") or 0))))
+    status_placeholder.caption(job.get("message") or "RAG 评测处理中...")
+    details = [
+        f"阶段：{job.get('stage', '-')}",
+        f"case：{job.get('processed_cases', 0)}/{job.get('total_cases', 0)}",
+    ]
+    if job.get("current_query"):
+        details.append(f"当前 query：{job.get('current_query')}")
+    if job.get("log_path"):
+        details.append(f"日志：{job.get('log_path')}")
+    detail_placeholder.caption(" | ".join(details))
+
+
+def poll_rag_eval_job(job_id: str, timeout_seconds: int = 3600) -> dict | None:
+    status_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    detail_placeholder = st.empty()
+    started = time.monotonic()
+
+    while True:
+        if time.monotonic() - started > timeout_seconds:
+            st.error(f"RAG 评测仍在后端处理中，但前端等待超过 {timeout_seconds} 秒。")
+            return None
+
+        response = requests.get(f"{API_BASE_URL}/rag/eval_jobs/{job_id}", timeout=20)
+        if not response.ok:
+            st.error(extract_error_message(response))
+            return None
+
+        job = response.json()
+        _render_rag_eval_job_progress(job, progress_bar, status_placeholder, detail_placeholder)
+
+        if job.get("status") == "completed":
+            progress_bar.progress(100)
+            return job
+        if job.get("status") == "failed":
+            st.error(job.get("error") or "RAG 评测失败。")
+            return None
+
+        time.sleep(1)
+
+
 def run_rag_evaluation(top_k: int = 5, threshold: float = 0.5):
     payload = {
         "user_id": st.session_state["user_id"],
@@ -611,20 +824,32 @@ def run_rag_evaluation(top_k: int = 5, threshold: float = 0.5):
         "top_k": int(top_k),
         "low_quality_mrr_threshold": float(threshold),
     }
-    response = requests.post(
-        f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/rag/evaluate",
-        json=payload,
-        timeout=180,
-    )
-    if response.ok:
-        st.session_state["rag_eval_data"] = response.json()
-        st.session_state["rag_eval_session_id"] = st.session_state["selected_session_id"]
-        load_agent_runs(limit=20, run_type="rag.evaluate")
-        load_recent_events(limit=20)
-        load_rag_quality_dashboard(limit=50)
-        st.success("RAG 评测已完成。")
-    else:
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/study_sessions/{st.session_state['selected_session_id']}/rag/evaluate_jobs",
+            json=payload,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        st.error(f"RAG 评测任务启动失败：{exc}")
+        return
+    if not response.ok:
         st.error(extract_error_message(response))
+        return
+
+    job = poll_rag_eval_job(response.json()["job_id"])
+    if not job:
+        return
+    st.session_state["rag_eval_data"] = job.get("result") or {}
+    st.session_state["rag_eval_session_id"] = st.session_state["selected_session_id"]
+    load_agent_runs(limit=20, run_type="rag.evaluate")
+    load_recent_events(limit=20)
+    load_rag_quality_dashboard(limit=50)
+    log_path = st.session_state["rag_eval_data"].get("log_path") or job.get("log_path")
+    if log_path:
+        st.success(f"RAG 评测已完成。日志：{log_path}")
+    else:
+        st.success("RAG 评测已完成。")
 
 
 def load_rag_quality_dashboard(limit: int = 50):
@@ -711,14 +936,18 @@ def render_review_items(review_items: list[dict]):
             st.caption(f"{item['topic']}: {item['summary']}")
 
 
-def render_retrieval_debug(retrieval_debug: dict | None):
+def render_retrieval_debug(retrieval_debug: dict | None, eval_case: dict | None = None):
     if not retrieval_debug:
         return
+    eval_case = eval_case or {}
+    original_query = retrieval_debug.get("original_query") or eval_case.get("query") or retrieval_debug.get("query", "")
+    rewritten_query = retrieval_debug.get("rewritten_query") or eval_case.get("rewritten_query") or retrieval_debug.get("query", "")
+    rewrite_reason = retrieval_debug.get("rewrite_reason") or eval_case.get("rewrite_reason", "")
     with st.expander("检索调试", expanded=False):
         st.caption(
-            f"原始问题：{retrieval_debug.get('original_query', '')}\n"
-            f"\n改写问题：{retrieval_debug.get('rewritten_query', '')}\n"
-            f"\n改写原因：{retrieval_debug.get('rewrite_reason', '')}"
+            f"原始问题：{original_query}\n"
+            f"\n改写问题：{rewritten_query}\n"
+            f"\n改写原因：{rewrite_reason}"
         )
         route_strategy = retrieval_debug.get("route_strategy") or {}
         if retrieval_debug.get("question_type") or route_strategy:
@@ -1655,6 +1884,13 @@ with rag_eval_tab:
     st.subheader("RAG评测")
     if st.session_state["selected_session_id"] is None:
         st.info("先新建会话或导入资料后再运行 RAG 评测。")
+        no_session_col1, no_session_col2 = st.columns([1, 1])
+        with no_session_col1:
+            if st.button("新建并导入SciFact Benchmark", use_container_width=True):
+                import_scifact_benchmark()
+        with no_session_col2:
+            if st.button("新建并导入中文T2 Benchmark", use_container_width=True):
+                import_t2retrieval_benchmark()
     else:
         rag_eval_col1, rag_eval_col2 = st.columns([1, 1])
         with rag_eval_col1:
@@ -1662,13 +1898,33 @@ with rag_eval_tab:
         with rag_eval_col2:
             rag_eval_threshold = st.slider("低质量阈值(MRR)", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
 
-        rag_action_col1, rag_action_col2 = st.columns([1, 1])
+        rag_action_col1, rag_action_col2, rag_action_col3, rag_action_col4 = st.columns([1, 1, 1, 1])
         with rag_action_col1:
             if st.button("预览默认评测集", use_container_width=True):
                 load_rag_eval_cases(limit=8)
         with rag_action_col2:
+            if st.button("加载SciFact评测集", use_container_width=True):
+                load_scifact_eval_cases(limit=300)
+        with rag_action_col3:
+            if st.button("新建并导入SciFact", use_container_width=True):
+                import_scifact_benchmark()
+        with rag_action_col4:
             if st.button("运行RAG评测", use_container_width=True):
                 run_rag_evaluation(top_k=rag_eval_top_k, threshold=rag_eval_threshold)
+        zh_action_col1, zh_action_col2 = st.columns([1, 1])
+        with zh_action_col1:
+            t2_case_limit = st.number_input(
+                "中文T2评测条数",
+                min_value=1,
+                max_value=200,
+                value=50,
+                step=10,
+            )
+            if st.button("加载中文T2评测集", use_container_width=True):
+                load_t2retrieval_eval_cases(limit=t2_case_limit)
+        with zh_action_col2:
+            if st.button("新建并导入中文T2", use_container_width=True):
+                import_t2retrieval_benchmark()
 
         rag_eval_cases = get_current_rag_eval_cases()
         if rag_eval_cases:
@@ -1681,7 +1937,9 @@ with rag_eval_tab:
         rag_eval_data = get_current_rag_eval_data()
         if rag_eval_data:
             metrics = rag_eval_data.get("metrics", {})
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            if rag_eval_data.get("log_path"):
+                st.caption(f"评测日志：{rag_eval_data.get('log_path')}")
+            metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
             with metric_col1:
                 st.metric("Case 数", rag_eval_data.get("case_count", 0))
             with metric_col2:
@@ -1690,6 +1948,8 @@ with rag_eval_tab:
                 st.metric("Recall@1", (metrics.get("recall_at", {}) or {}).get("1", 0))
             with metric_col4:
                 st.metric("Recall@5", (metrics.get("recall_at", {}) or {}).get("5", 0))
+            with metric_col5:
+                st.metric("NDCG@5", (metrics.get("ndcg_at", {}) or {}).get("5", 0))
 
             low_quality_cases = rag_eval_data.get("low_quality_cases", [])
             buckets = metrics.get("buckets") or {}
@@ -1719,7 +1979,7 @@ with rag_eval_tab:
                         f"rewritten={item.get('rewritten_query', '')} | "
                         f"strategy={item.get('query_strategy', 'single_query')}"
                     )
-                    render_retrieval_debug(item.get("retrieval_debug", {}))
+                    render_retrieval_debug(item.get("retrieval_debug", {}), eval_case=item)
         else:
             st.caption("先预览默认评测集，再运行 RAG 评测查看 Recall@k、MRR 和低质量 query。")
 
@@ -1734,7 +1994,7 @@ with rag_quality_tab:
         quality_data = get_current_rag_quality_data()
         if quality_data:
             summary = quality_data.get("summary", {})
-            q_col1, q_col2, q_col3, q_col4 = st.columns(4)
+            q_col1, q_col2, q_col3, q_col4, q_col5 = st.columns(5)
             with q_col1:
                 st.metric("评测次数", summary.get("eval_run_count", 0))
             with q_col2:
@@ -1742,6 +2002,8 @@ with rag_quality_tab:
             with q_col3:
                 st.metric("平均Recall@1", summary.get("avg_recall_at_1", 0))
             with q_col4:
+                st.metric("平均NDCG@5", summary.get("avg_ndcg_at_5", 0))
+            with q_col5:
                 st.metric("低质样本", summary.get("low_quality_sample_count", 0))
 
             distributions = quality_data.get("distributions", {})

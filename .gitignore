@@ -37,9 +37,14 @@ Zero_RAG/processed_md5.json
 Zero_RAG/chroma_db/
 uploaded_study_materials/
 codex_chat/
+datasets/scifact/
+benchmarks/scifact/
+datasets/t2retrieval/
+benchmarks/t2retrieval/
 
 # Local logs and temp files
 *.log
+logs/rag_eval/
 *.tmp
 *.temp
 .pytest_cache/

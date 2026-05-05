@@ -1,10 +1,13 @@
 beautifulsoup4>=4.12
 chromadb>=0.5
 dashscope>=1.20
+datasets>=2.19
 fastapi>=0.115
 jieba>=0.42
 langchain-core>=0.3
 openai>=1.30
+pandas>=2.0
+pyarrow>=15.0
 PyPDF2>=3.0
 pydantic>=2.7
 python-docx>=1.1
