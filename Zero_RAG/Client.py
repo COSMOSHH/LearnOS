@@ -781,6 +781,11 @@ def _render_rag_eval_job_progress(job: dict, progress_bar, status_placeholder, d
         f"阶段：{job.get('stage', '-')}",
         f"case：{job.get('processed_cases', 0)}/{job.get('total_cases', 0)}",
     ]
+    if job.get("ablation_variant_label"):
+        details.append(
+            f"配置：{job.get('ablation_variant_index', 0)}/{job.get('ablation_variant_count', 0)} "
+            f"{job.get('ablation_variant_label')}"
+        )
     if job.get("current_query"):
         details.append(f"当前 query：{job.get('current_query')}")
     if job.get("log_path"):
@@ -788,7 +793,7 @@ def _render_rag_eval_job_progress(job: dict, progress_bar, status_placeholder, d
     detail_placeholder.caption(" | ".join(details))
 
 
-def poll_rag_eval_job(job_id: str, timeout_seconds: int = 3600) -> dict | None:
+def poll_rag_eval_job(job_id: str, timeout_seconds: int = 14400) -> dict | None:
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
     detail_placeholder = st.empty()
@@ -822,6 +827,7 @@ def run_rag_evaluation(
     threshold: float = 0.5,
     retrieval_config: dict | None = None,
     compare_to_original: bool = False,
+    run_ablation: bool = False,
 ):
     payload = {
         "user_id": st.session_state["user_id"],
@@ -830,6 +836,7 @@ def run_rag_evaluation(
         "low_quality_mrr_threshold": float(threshold),
         "retrieval_config": retrieval_config or {"mode": "latest"},
         "compare_to_original": bool(compare_to_original),
+        "run_ablation": bool(run_ablation),
     }
     try:
         response = requests.post(
@@ -844,7 +851,9 @@ def run_rag_evaluation(
         st.error(extract_error_message(response))
         return
 
-    job = poll_rag_eval_job(response.json()["job_id"])
+    job_id = response.json()["job_id"]
+    st.session_state["rag_eval_job_id"] = job_id
+    job = poll_rag_eval_job(job_id)
     if not job:
         return
     st.session_state["rag_eval_data"] = job.get("result") or {}
@@ -857,6 +866,27 @@ def run_rag_evaluation(
         st.success(f"RAG 评测已完成。日志：{log_path}")
     else:
         st.success("RAG 评测已完成。")
+
+
+def restore_rag_eval_job(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        st.warning("请输入 RAG 评测 job_id。")
+        return
+    st.session_state["rag_eval_job_id"] = job_id
+    job = poll_rag_eval_job(job_id)
+    if not job:
+        return
+    st.session_state["rag_eval_data"] = job.get("result") or {}
+    st.session_state["rag_eval_session_id"] = st.session_state.get("selected_session_id")
+    load_agent_runs(limit=20, run_type="rag.evaluate")
+    load_recent_events(limit=20)
+    load_rag_quality_dashboard(limit=50)
+    log_path = st.session_state["rag_eval_data"].get("log_path") or job.get("log_path")
+    if log_path:
+        st.success(f"已恢复 RAG 评测结果。日志：{log_path}")
+    else:
+        st.success("已恢复 RAG 评测结果。")
 
 
 def load_rag_quality_dashboard(limit: int = 50):
@@ -1940,8 +1970,14 @@ with rag_eval_tab:
         else:
             rag_eval_retrieval_config = {"mode": "latest"}
             rag_eval_compare_original = st.checkbox("同时跑原始RAG作为 baseline", value=True)
+        rag_eval_run_ablation = st.checkbox("运行 Ablation 对比（较慢）", value=False)
+        restore_job_id = st.text_input(
+            "恢复RAG评测 job_id",
+            value="",
+            placeholder="例如 94dd0682f83b49dd8e8d1c7548beadf6",
+        )
 
-        rag_action_col1, rag_action_col2, rag_action_col3, rag_action_col4 = st.columns([1, 1, 1, 1])
+        rag_action_col1, rag_action_col2, rag_action_col3, rag_action_col4, rag_action_col5 = st.columns([1, 1, 1, 1, 1])
         with rag_action_col1:
             if st.button("预览默认评测集", use_container_width=True):
                 load_rag_eval_cases(limit=8)
@@ -1958,7 +1994,11 @@ with rag_eval_tab:
                     threshold=rag_eval_threshold,
                     retrieval_config=rag_eval_retrieval_config,
                     compare_to_original=rag_eval_compare_original,
+                    run_ablation=rag_eval_run_ablation,
                 )
+        with rag_action_col5:
+            if st.button("恢复评测任务", use_container_width=True):
+                restore_rag_eval_job(restore_job_id)
         zh_action_col1, zh_action_col2 = st.columns([1, 1])
         with zh_action_col1:
             t2_case_limit = st.number_input(
@@ -2038,13 +2078,45 @@ with rag_eval_tab:
                     st.metric("NDCG@5", (metrics.get("ndcg_at", {}) or {}).get("5", 0), delta.get("ndcg_at_5", 0))
                     st.caption(f"原始：{baseline_ndcg.get('5', 0)}")
 
+            ablation = rag_eval_data.get("ablation") or {}
+            ablation_variants = ablation.get("variants") or []
+            if ablation_variants:
+                st.markdown("**Ablation 对比**")
+                rows = []
+                for item in ablation_variants:
+                    item_metrics = item.get("metrics") or {}
+                    item_recall = item_metrics.get("recall_at") or {}
+                    item_ndcg = item_metrics.get("ndcg_at") or {}
+                    item_delta = item.get("delta_vs_original") or {}
+                    rows.append(
+                        {
+                            "配置": item.get("label") or item.get("name"),
+                            "MRR": item_metrics.get("mrr", 0),
+                            "ΔMRR": item_delta.get("mrr", 0),
+                            "Recall@1": item_recall.get("1", 0),
+                            "Recall@5": item_recall.get("5", 0),
+                            "NDCG@5": item_ndcg.get("5", 0),
+                            "低质数": item.get("low_quality_count", 0),
+                        }
+                    )
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+
             low_quality_cases = rag_eval_data.get("low_quality_cases", [])
+            low_quality_summary = rag_eval_data.get("low_quality_summary") or {}
             buckets = metrics.get("buckets") or {}
             if buckets:
                 st.markdown("**问题类型分桶指标**")
                 st.json(buckets)
 
             st.markdown("**低质量 Query 分析**")
+            if low_quality_summary:
+                lq_col1, lq_col2, lq_col3 = st.columns(3)
+                with lq_col1:
+                    st.metric("No Hit", low_quality_summary.get("failed_case_count", 0))
+                with lq_col2:
+                    st.metric("Late Hit", low_quality_summary.get("late_hit_case_count", 0))
+                with lq_col3:
+                    st.metric("Weak Confidence", low_quality_summary.get("weak_confidence_case_count", 0))
             if low_quality_cases:
                 for item in low_quality_cases:
                     with st.expander(f"{item.get('query', '')} | {item.get('reason', '')}", expanded=False):

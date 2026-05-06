@@ -57,7 +57,7 @@ from services.plan_service import (
     update_plan_item_completion,
 )
 from services.query_service import expand_query_to_multi_queries, plan_retrieval_route, rewrite_query
-from services.rag_eval_service import build_eval_dataset_template, build_session_eval_cases, evaluate_retrieval_cases
+from services.rag_eval_service import build_eval_dataset_template, build_session_eval_cases, evaluate_retrieval_cases, resolve_retrieval_config
 from services.rag_quality_service import build_rag_quality_dashboard, save_low_quality_samples
 from services.quiz_service import (
     create_quiz_set,
@@ -237,6 +237,7 @@ class RetrievalEvalRequest(BaseModel):
     low_quality_mrr_threshold: float = 0.5
     retrieval_config: dict = Field(default_factory=dict)
     compare_to_original: bool = False
+    run_ablation: bool = False
 
 
 class BenchmarkImportRequest(BaseModel):
@@ -833,6 +834,7 @@ def _write_rag_eval_log(
     log_path = RAG_EVAL_LOG_DIR / f"session_{session_id}_{timestamp}_{safe_job_id}.json"
     metrics = payload.get("metrics", {})
     low_quality_cases = payload.get("low_quality_cases", [])
+    low_quality_summary = payload.get("low_quality_summary", {})
     log_payload = {
         "log_type": "rag_retrieval_evaluation",
         "generated_at": timestamp,
@@ -846,11 +848,14 @@ def _write_rag_eval_log(
             "case_count": payload.get("case_count", 0),
             "retrieval_config": request.retrieval_config,
             "compare_to_original": request.compare_to_original,
+            "run_ablation": request.run_ablation,
         },
         "metrics": metrics,
         "low_quality_cases": low_quality_cases,
+        "low_quality_summary": low_quality_summary,
         "cases": payload.get("cases", []),
         "comparison": payload.get("comparison"),
+        "ablation": payload.get("ablation"),
         "duration_ms": duration_ms,
         "llm_analysis_prompt": (
             "请分析这次 RAG 检索评测结果。重点判断：1. 召回质量是否达标；"
@@ -883,6 +888,117 @@ def _build_rag_eval_comparison(current_payload: dict, baseline_payload: dict) ->
     }
 
 
+def _rag_eval_metric_delta(current_metrics: dict, baseline_metrics: dict) -> dict:
+    current_recall = current_metrics.get("recall_at", {}) or {}
+    baseline_recall = baseline_metrics.get("recall_at", {}) or {}
+    current_ndcg = current_metrics.get("ndcg_at", {}) or {}
+    baseline_ndcg = baseline_metrics.get("ndcg_at", {}) or {}
+    return {
+        "mrr": round(current_metrics.get("mrr", 0) - baseline_metrics.get("mrr", 0), 4),
+        "recall_at_1": round(current_recall.get("1", 0) - baseline_recall.get("1", 0), 4),
+        "recall_at_5": round(current_recall.get("5", 0) - baseline_recall.get("5", 0), 4),
+        "ndcg_at_5": round(current_ndcg.get("5", 0) - baseline_ndcg.get("5", 0), 4),
+    }
+
+
+def _build_rag_ablation_configs(active_config: dict | None) -> list[dict]:
+    latest = resolve_retrieval_config({"mode": "latest"})
+    active = resolve_retrieval_config(active_config or {"mode": "latest"})
+    variants = [
+        {"name": "original", "label": "原始RAG", "config": {"mode": "original"}},
+        {"name": "latest", "label": "最新RAG", "config": {"mode": "latest"}},
+        {
+            "name": "latest_without_rewrite",
+            "label": "最新RAG - Query Rewrite",
+            "config": {**latest, "mode": "custom", "use_query_rewrite": False},
+        },
+        {
+            "name": "latest_without_bm25",
+            "label": "最新RAG - BM25",
+            "config": {**latest, "mode": "custom", "use_bm25": False},
+        },
+        {
+            "name": "latest_without_rerank",
+            "label": "最新RAG - Rerank",
+            "config": {**latest, "mode": "custom", "use_rerank": False},
+        },
+        {
+            "name": "latest_without_multi_query",
+            "label": "最新RAG - Multi-Query",
+            "config": {**latest, "mode": "custom", "use_multi_query": False},
+        },
+        {
+            "name": "latest_without_parent",
+            "label": "最新RAG - Parent回填",
+            "config": {**latest, "mode": "custom", "use_parent": False},
+        },
+    ]
+    if active.get("mode") == "custom":
+        variants.insert(1, {"name": "active_custom", "label": "当前自定义配置", "config": active})
+
+    deduped = []
+    seen = set()
+    for variant in variants:
+        resolved = resolve_retrieval_config(variant["config"])
+        key = json.dumps(resolved, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({**variant, "config": resolved})
+    return deduped
+
+
+def _run_rag_eval_ablation(
+    *,
+    retriever,
+    eval_cases: list[dict],
+    request: RetrievalEvalRequest,
+    session_context: str,
+    progress_callback=None,
+) -> dict:
+    results = []
+    variants = _build_rag_ablation_configs(request.retrieval_config)
+    variant_count = max(1, len(variants))
+    total_cases = max(1, len(eval_cases))
+    for variant_index, variant in enumerate(variants, start=1):
+        if progress_callback:
+            progress_callback(variant_index, variant_count, 0, total_cases, "", variant)
+
+        def update_variant_progress(done: int, total: int, query: str):
+            if progress_callback:
+                progress_callback(variant_index, variant_count, done, total, query, variant)
+
+        variant_payload = evaluate_retrieval_cases(
+            retriever,
+            eval_cases,
+            rewrite_query=rewrite_query,
+            expand_query_to_multi_queries=expand_query_to_multi_queries,
+            plan_retrieval_route=plan_retrieval_route,
+            session_context=session_context,
+            llm_generator=llm_generator,
+            top_k=request.top_k,
+            low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+            retrieval_config=variant["config"],
+            progress_callback=update_variant_progress if progress_callback else None,
+        )
+        results.append(
+            {
+                "name": variant["name"],
+                "label": variant["label"],
+                "config": variant_payload.get("metrics", {}).get("retrieval_config", variant["config"]),
+                "metrics": variant_payload.get("metrics", {}),
+                "low_quality_count": len(variant_payload.get("low_quality_cases", [])),
+                "low_quality_summary": variant_payload.get("low_quality_summary", {}),
+            }
+        )
+
+    baseline = next((item for item in results if item["name"] == "original"), results[0] if results else {})
+    baseline_metrics = baseline.get("metrics", {}) if baseline else {}
+    for item in results:
+        item["delta_vs_original"] = _rag_eval_metric_delta(item.get("metrics", {}), baseline_metrics)
+    return {"baseline": "original", "variants": results}
+
+
 def _run_rag_eval_job(job_id: str, *, session_id: int, request_payload: dict):
     started = time.perf_counter()
     run_id = None
@@ -908,7 +1024,14 @@ def _run_rag_eval_job(job_id: str, *, session_id: int, request_payload: dict):
             user_id=request.user_id,
             title="RAG 检索评测",
             input_summary=f"case_count={len(eval_cases)}",
-            metadata={"top_k": request.top_k, "threshold": request.low_quality_mrr_threshold, "job_id": job_id},
+            metadata={
+                "top_k": request.top_k,
+                "threshold": request.low_quality_mrr_threshold,
+                "job_id": job_id,
+                "retrieval_config": request.retrieval_config,
+                "compare_to_original": request.compare_to_original,
+                "run_ablation": request.run_ablation,
+            },
         )
 
         def update_eval_progress(done: int, total: int, query: str):
@@ -957,6 +1080,50 @@ def _run_rag_eval_job(job_id: str, *, session_id: int, request_payload: dict):
                 retrieval_config={"mode": "original"},
             )
             payload["comparison"] = _build_rag_eval_comparison(payload, baseline_payload)
+        if request.run_ablation:
+            _update_rag_eval_job(
+                job_id,
+                status="running",
+                stage="ablation",
+                message="正在运行 RAG ablation 对比评测。",
+                progress=97,
+            )
+
+            def update_ablation_progress(
+                variant_index: int,
+                variant_count: int,
+                done: int,
+                total: int,
+                query: str,
+                variant: dict,
+            ):
+                total = max(1, int(total or 1))
+                variant_count = max(1, int(variant_count or 1))
+                variant_fraction = ((max(1, variant_index) - 1) + (max(0, done) / total)) / variant_count
+                progress = min(99, 96 + int(variant_fraction * 3))
+                label = variant.get("label") or variant.get("name") or "ablation"
+                _update_rag_eval_job(
+                    job_id,
+                    status="running",
+                    stage="ablation",
+                    message=f"正在运行 RAG ablation {variant_index}/{variant_count}：{label}。",
+                    processed_cases=done,
+                    total_cases=total,
+                    current_query=(query or "")[:180],
+                    progress=progress,
+                    ablation_variant_index=variant_index,
+                    ablation_variant_count=variant_count,
+                    ablation_variant_name=variant.get("name", ""),
+                    ablation_variant_label=label,
+                )
+
+            payload["ablation"] = _run_rag_eval_ablation(
+                retriever=retriever,
+                eval_cases=eval_cases,
+                request=request,
+                session_context=_build_session_context_text(session_id),
+                progress_callback=update_ablation_progress,
+            )
         low_quality_sample_count = save_low_quality_samples(
             session_id=session_id,
             user_id=request.user_id,
@@ -1864,7 +2031,13 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
         user_id=request.user_id,
         title="RAG 检索评测",
         input_summary=f"case_count={len(request.cases)}",
-        metadata={"top_k": request.top_k, "threshold": request.low_quality_mrr_threshold},
+        metadata={
+            "top_k": request.top_k,
+            "threshold": request.low_quality_mrr_threshold,
+            "retrieval_config": request.retrieval_config,
+            "compare_to_original": request.compare_to_original,
+            "run_ablation": request.run_ablation,
+        },
     )
 
     try:
@@ -1894,6 +2067,13 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
                 retrieval_config={"mode": "original"},
             )
             payload["comparison"] = _build_rag_eval_comparison(payload, baseline_payload)
+        if request.run_ablation:
+            payload["ablation"] = _run_rag_eval_ablation(
+                retriever=retriever,
+                eval_cases=eval_cases,
+                request=request,
+                session_context=_build_session_context_text(session_id),
+            )
         low_quality_sample_count = save_low_quality_samples(
             session_id=session_id,
             user_id=request.user_id,

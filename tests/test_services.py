@@ -149,6 +149,24 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(route["route_strategy"]["use_multi_query"])
         self.assertGreater(route["route_strategy"]["vector_top_k"], 5)
 
+        class FakeRewriteLLM:
+            def chat_once(self, **kwargs):
+                return '{"rewritten_query": "司鱼在T2Retrieval Benchmark中的表现如何", "rewrite_reason": "test"}'
+
+        guarded = query_service.rewrite_query("司鱼怎么样", llm_generator=FakeRewriteLLM())
+        self.assertEqual(guarded["rewritten_query"], "司鱼怎么样")
+        self.assertIn("rewrite_guard", guarded["rewrite_reason"])
+
+        numeric_route = query_service.plan_retrieval_route("4008888518是哪里的电话")
+        self.assertEqual(numeric_route["classification"]["question_type"], "numeric_entity")
+        self.assertEqual(numeric_route["route_strategy"]["bm25_top_k"], 20)
+        numeric_expanded = query_service.expand_query_to_multi_queries("4008888518是哪里的电话")
+        self.assertIn("4008888518", numeric_expanded["queries"])
+
+        literal_route = query_service.plan_retrieval_route("欲钱买春光灿烂打一肖")
+        self.assertEqual(literal_route["classification"]["question_type"], "literal_riddle")
+        self.assertEqual(literal_route["route_strategy"]["bm25_top_k"], 20)
+
         splitter = SemanticTextSplitter(chunk_size=80, chunk_overlap=10)
         chunks = splitter.split_text_with_metadata(
             "# MySQL 锁\n## 行锁\n行锁用于锁住索引记录。\n## 间隙锁\n间隙锁用于防止幻读。",
@@ -259,6 +277,8 @@ class ServiceTests(unittest.TestCase):
         self.assertAlmostEqual(payload["metrics"]["mrr"], 0.5)
         self.assertAlmostEqual(payload["metrics"]["ndcg_at"]["3"], 0.5)
         self.assertGreaterEqual(len(payload["low_quality_cases"]), 1)
+        self.assertEqual(payload["low_quality_summary"]["failed_case_count"], 1)
+        self.assertEqual(payload["low_quality_summary"]["late_hit_case_count"], 0)
 
     def test_rag_eval_original_config_disables_advanced_steps(self):
         class FakeRetriever:

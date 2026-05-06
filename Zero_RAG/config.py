@@ -29,7 +29,7 @@ rerank_top_k = 3
 
 # Models
 embedding_model = "text-embedding-v4"
-chat_model = "qwen3-max"
+chat_model = "qwen-plus"
 
 
 # Database / knowledge defaults

@@ -426,6 +426,14 @@ def evaluate_retrieval_cases(
                 "retrieval_config": retrieval_config,
             },
             "low_quality_cases": [],
+            "low_quality_summary": {
+                "failed_case_count": 0,
+                "late_hit_case_count": 0,
+                "weak_confidence_case_count": 0,
+                "failed_cases": [],
+                "late_hit_cases": [],
+                "weak_confidence_cases": [],
+            },
             "cases": [],
         }
 
@@ -451,29 +459,49 @@ def evaluate_retrieval_cases(
         bucket["ndcg_at_5"] = round(bucket.pop("ndcg_at_5_sum") / count, 4)
 
     low_quality_cases = []
+    low_quality_groups = {
+        "failed_cases": [],
+        "late_hit_cases": [],
+        "weak_confidence_cases": [],
+    }
     for case in per_case:
         rr = case["reciprocal_rank"]
         rank = case["first_hit_rank"]
         reason = None
+        category = None
         if rank is None:
             reason = "no_hit"
+            category = "failed_cases"
         elif rr < low_quality_mrr_threshold:
             reason = f"late_hit_rank_{rank}"
+            category = "late_hit_cases"
         elif case.get("top_results") and (case["top_results"][0].get("score", 0) or 0) < 0.3:
             reason = "weak_top1_score"
+            category = "weak_confidence_cases"
 
         if reason:
-            low_quality_cases.append(
-                {
-                    "query": case["query"],
-                    "rewritten_query": case["rewritten_query"],
-                    "question_type": case.get("question_type", "unknown"),
-                    "route_strategy": case.get("route_strategy", {}),
-                    "reason": reason,
-                    "reciprocal_rank": rr,
-                    "top1": (case.get("top_results") or [{}])[0],
-                }
-            )
+            low_quality_item = {
+                "query": case["query"],
+                "rewritten_query": case["rewritten_query"],
+                "question_type": case.get("question_type", "unknown"),
+                "route_strategy": case.get("route_strategy", {}),
+                "reason": reason,
+                "category": category,
+                "first_hit_rank": rank,
+                "reciprocal_rank": rr,
+                "top1": (case.get("top_results") or [{}])[0],
+            }
+            low_quality_cases.append(low_quality_item)
+            low_quality_groups[category].append(low_quality_item)
+
+    low_quality_summary = {
+        "failed_case_count": len(low_quality_groups["failed_cases"]),
+        "late_hit_case_count": len(low_quality_groups["late_hit_cases"]),
+        "weak_confidence_case_count": len(low_quality_groups["weak_confidence_cases"]),
+        "failed_cases": low_quality_groups["failed_cases"],
+        "late_hit_cases": low_quality_groups["late_hit_cases"],
+        "weak_confidence_cases": low_quality_groups["weak_confidence_cases"],
+    }
 
     return {
         "case_count": case_count,
@@ -487,5 +515,6 @@ def evaluate_retrieval_cases(
             "retrieval_config": retrieval_config,
         },
         "low_quality_cases": low_quality_cases,
+        "low_quality_summary": low_quality_summary,
         "cases": per_case,
     }

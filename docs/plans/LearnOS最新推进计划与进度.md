@@ -1,6 +1,6 @@
 # LearnOS 最新推进计划与进度
 
-更新日期：2026-05-04
+更新日期：2026-05-06
 
 ## 总体路线
 
@@ -18,9 +18,20 @@
 
 | 阶段 | 目标 | 当前状态 | 建议优先级 |
 | --- | --- | --- | --- |
-| 第一阶段 | RAG 可评测、可观测、可解释 | 已完成主链路，质量闭环第一版可用 | P0 |
+| 第一阶段 | RAG 可评测、可观测、可解释 | 已完成主链路和评测闭环，进入第一阶段收口验证 | P0 |
 | 第二阶段 | Learning Coach Agent 决策闭环 | 有计划、复习、测验服务，但 Agent 未接入主链路 | P1 |
 | 第三阶段 | Reflection 自动评估与修正 | 有回答评测，但没有自动反思重写 | P2 |
+
+## 2026-05-06 更新：RAG 主链路收口
+
+本轮围绕 2026-05-05 优化版与 2026-05-06 原始版 RAG 对比结论，完成四项收口工作：
+
+- [x] Query Rewrite Guard：禁止改写注入 `T2Retrieval`、`Benchmark`、`语料库`、`知识库` 等系统/评测语境词；数字实体、谜语/字面匹配类 query 默认保持原 query，避免意图漂移。
+- [x] 特殊检索路由：新增 `numeric_entity` 与 `literal_riddle` 两类路由，采用 BM25-heavy / exact-friendly 策略处理电话、编号、谜语、歇后语等非通用语义检索问题。
+- [x] Ablation 对比：RAG 评测支持一键运行 original、latest、去掉 Query Rewrite、去掉 BM25、去掉 Rerank、去掉 Multi-Query、去掉 Parent 回填等配置，前端展示各配置相对原始 RAG 的指标差异。
+- [x] 低质样本拆分：将 `low_quality_cases` 拆分为 `failed_cases`、`late_hit_cases`、`weak_confidence_cases`，日志和前端可分别查看 no-hit、排序靠后、置信度偏低三类问题。
+
+当前判断：第一阶段还不建议立刻切到 Agent 主线，下一步应先用同一批 T2Retrieval case 回归验证 Guard 和特殊路由是否把 MRR/NDCG 拉回到不低于原始 RAG，再扩到 500 cases 做稳定性验证。
 
 ## 第一阶段：RAG 主链路打磨
 
@@ -60,6 +71,11 @@
 - [x] 低质 Query 沉淀：低质量样本可进入质量看板。
 - [x] RAG 质量看板：已展示 MRR、Recall@1、路由分布、低质原因和样本。
 - [x] Run / Step 观测：已记录学习问答、检索、生成、评估等步骤。
+- [x] RAG 对比配置：已支持最新 RAG、原始 RAG、自定义开关和原始 baseline 对比。
+- [x] RAG Ablation：已支持 Query Rewrite、BM25、Rerank、Multi-Query、Parent 回填等模块级消融对比。
+- [x] Query Rewrite Guard：已对系统词注入、数字实体改写、谜语/字面匹配改写和短 query 过度扩写做保护。
+- [x] 特殊 Query 路由：已新增 `numeric_entity`、`literal_riddle` 两类检索路由。
+- [x] 低质 Query 分类：已拆分 no-hit、late-hit、weak-confidence 三类低质样本。
 
 ### 待推进清单
 
@@ -75,13 +91,13 @@
   - 目标：核心评测集低于阈值时能暴露问题。
   - 输出：最小 CI 或本地命令，跑测试 + RAG benchmark。
 
-- [ ] 增加 query rewrite 前后对比。
+- [x] 增加 query rewrite 前后对比。
   - 目标：解释改写是否真的提升召回。
-  - 输出：记录原 query 与 rewritten query 的召回结果差异。
+  - 输出：通过 RAG 对比配置和 ablation 记录 original/latest/without-rewrite 的召回与排序指标差异。
 
-- [ ] 增加 rerank 前后排序对比。
+- [x] 增加 rerank 前后排序对比。
   - 目标：解释 rerank 是否提升结果排序。
-  - 输出：debug 面板展示 rerank 前后 top-k。
+  - 输出：通过 ablation 记录 latest 与 without-rerank 的 MRR、Recall、NDCG 和低质样本差异；后续仍可增强到 debug 面板展示逐 query rerank 前后 top-k。
 
 - [ ] 加入 embedding 缓存。
   - 目标：降低重复入库和重复 query 的 embedding 成本。
@@ -106,9 +122,9 @@
 ### 第一阶段验收标准
 
 - [x] 有一组稳定 RAG benchmark。
-- [ ] 每次 RAG 优化后可以量化对比指标。
+- [x] 每次 RAG 优化后可以量化对比指标。
 - [ ] 能解释一次回答的检索过程：原 query、改写 query、召回结果、rerank 排序、最终上下文、来源依据。
-- [ ] 能定位低质回答原因：切分问题、召回问题、重排问题、上下文压缩问题、生成问题。
+- [ ] 能定位低质回答原因：已完成检索侧 no-hit / late-hit / weak-confidence 分类；切分、上下文压缩、生成侧归因仍待补齐。
 - [ ] 能在面试中讲清楚：为什么这个 RAG 不是简单向量问答。
 
 ### 第一阶段建议里程碑
@@ -116,8 +132,8 @@
 | 里程碑 | 内容 | 优先级 |
 | --- | --- | --- |
 | M1 | 扩充 benchmark + Recall@3 / Recall@5 / NDCG | 已完成 |
-| M2 | Query rewrite 与 rerank 前后对比 | P0 |
-| M3 | 低质 query 状态管理 | P1 |
+| M2 | Query rewrite 与 rerank 前后对比 | 已完成第一版 ablation |
+| M3 | 低质 query 状态管理 | 部分完成：已拆分原因，状态流转待做 |
 | M4 | embedding / retrieval 缓存 | P1 |
 | M5 | token、耗时、成本统计 | P1 |
 | M6 | 更细粒度引用 | P2 |

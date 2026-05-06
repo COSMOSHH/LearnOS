@@ -2,6 +2,31 @@ import json
 import re
 
 
+FORBIDDEN_REWRITE_TERMS = (
+    "T2Retrieval",
+    "Benchmark",
+    "benchmark",
+    "corpus",
+    "语料库",
+    "知识库",
+    "数据集",
+    "评测集",
+    "benchmark corpus",
+)
+RIDDLE_LITERAL_TOKENS = (
+    "打一肖",
+    "打一生肖",
+    "打一动物",
+    "打一字",
+    "谜语",
+    "字谜",
+    "灯谜",
+    "歇后语",
+    "欲钱买",
+    "猜一",
+)
+
+
 PRONOUN_TOKENS = ("这个", "这个东西", "这个问题", "它", "它们", "前者", "后者", "上面", "这里", "那个", "那些")
 COMPARE_TOKENS = ("区别", "不同", "对比", "比较", "联系", "关系")
 WHY_TOKENS = ("为什么", "原因", "为啥")
@@ -101,6 +126,28 @@ ROUTE_PROFILES = {
         "max_context_chars": 1800,
         "per_chunk_max_chars": 420,
     },
+    "numeric_entity": {
+        "strategy_name": "numeric_exact_boost",
+        "use_multi_query": True,
+        "vector_top_k": 3,
+        "bm25_top_k": 20,
+        "final_top_k": 5,
+        "parent_window": 1,
+        "parent_max_chars": 900,
+        "max_context_chars": 1800,
+        "per_chunk_max_chars": 420,
+    },
+    "literal_riddle": {
+        "strategy_name": "literal_bm25_heavy",
+        "use_multi_query": True,
+        "vector_top_k": 3,
+        "bm25_top_k": 20,
+        "final_top_k": 5,
+        "parent_window": 1,
+        "parent_max_chars": 900,
+        "max_context_chars": 1800,
+        "per_chunk_max_chars": 420,
+    },
 }
 
 
@@ -124,6 +171,66 @@ def _normalize_query(query: str) -> str:
 
 def _contains_any(query: str, tokens: tuple[str, ...]) -> bool:
     return any(token in query for token in tokens)
+
+
+def _contains_numeric_entity(query: str) -> bool:
+    return bool(re.search(r"\d{6,}", query or ""))
+
+
+def _extract_numeric_entities(query: str) -> list[str]:
+    return re.findall(r"\d{6,}", query or "")
+
+
+def _is_literal_riddle_query(query: str) -> bool:
+    return _contains_any(query or "", RIDDLE_LITERAL_TOKENS)
+
+
+def _has_forbidden_rewrite_term(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(term.lower() in lowered for term in FORBIDDEN_REWRITE_TERMS)
+
+
+def _apply_rewrite_guard(original_query: str, rewritten_query: str, rewrite_reason: str) -> tuple[str, str]:
+    original_query = _normalize_query(original_query)
+    rewritten_query = _normalize_query(rewritten_query or original_query)
+    rewrite_reason = rewrite_reason or "normalized_only"
+
+    if not original_query or not rewritten_query:
+        return original_query, "rewrite_guard: empty_query"
+
+    if _has_forbidden_rewrite_term(rewritten_query) and not _has_forbidden_rewrite_term(original_query):
+        return original_query, f"rewrite_guard: forbidden_system_term; {rewrite_reason}"
+
+    if _contains_numeric_entity(original_query):
+        original_numbers = set(_extract_numeric_entities(original_query))
+        rewritten_numbers = set(_extract_numeric_entities(rewritten_query))
+        if not original_numbers.issubset(rewritten_numbers):
+            return original_query, f"rewrite_guard: numeric_entity_changed; {rewrite_reason}"
+        if rewritten_query != original_query:
+            return original_query, f"rewrite_guard: numeric_entity_exact; {rewrite_reason}"
+
+    if _is_literal_riddle_query(original_query) and rewritten_query != original_query:
+        return original_query, f"rewrite_guard: literal_query_exact; {rewrite_reason}"
+
+    if (
+        len(original_query) <= 12
+        and len(rewritten_query) > max(24, len(original_query) * 3)
+        and not rewrite_reason.startswith("history_context")
+    ):
+        return original_query, f"rewrite_guard: short_query_overexpanded; {rewrite_reason}"
+
+    return rewritten_query, rewrite_reason
+
+
+def _finalize_rewrite_payload(payload: dict) -> dict:
+    guarded_query, guarded_reason = _apply_rewrite_guard(
+        payload.get("original_query", ""),
+        payload.get("rewritten_query", ""),
+        payload.get("rewrite_reason", ""),
+    )
+    payload["rewritten_query"] = guarded_query
+    payload["rewrite_reason"] = guarded_reason
+    return payload
 
 
 def _summarize_history(history: list[dict] | None) -> str:
@@ -175,7 +282,7 @@ def rewrite_query(
     }
 
     if llm_generator is None or not original_query:
-        return payload
+        return _finalize_rewrite_payload(payload)
 
     prompt = f"""
 你是一个学习系统的检索查询改写助手。请把用户问题改写成更适合知识库检索的中文 query。
@@ -212,7 +319,7 @@ def rewrite_query(
     except Exception:
         pass
 
-    return payload
+    return _finalize_rewrite_payload(payload)
 
 
 def expand_query_to_multi_queries(
@@ -227,6 +334,32 @@ def expand_query_to_multi_queries(
 
     queries = [base_query] if base_query else []
     reason = "single_query"
+
+    if _contains_numeric_entity(original_query):
+        numbers = _extract_numeric_entities(original_query)
+        for number in numbers:
+            queries.extend([number, f"电话号码 {number}", f"{number} 归属地"])
+        normalized = []
+        seen = set()
+        for item in queries:
+            cleaned = _normalize_query(item)
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                normalized.append(cleaned)
+        return {"strategy": "numeric_entity_exact", "queries": normalized[:4]}
+
+    if _is_literal_riddle_query(original_query):
+        literal = re.sub(r"(打一肖|打一生肖|打一动物|打一字|谜语|字谜|灯谜|歇后语)", " ", original_query)
+        literal = _normalize_query(literal)
+        queries.extend([literal, f"{literal} 打一生肖", f"{literal} 谜语"])
+        normalized = []
+        seen = set()
+        for item in queries:
+            cleaned = _normalize_query(item)
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                normalized.append(cleaned)
+        return {"strategy": "literal_riddle_exact", "queries": normalized[:4]}
 
     if any(token in base_query for token in INTERVIEW_TOKENS):
         reason = "interview_query"
@@ -335,7 +468,13 @@ def classify_question_type(query: str, session_context: str = "", mode: str = "c
     normalized = _normalize_query(query)
     signals = []
 
-    if mode == "interview" or _contains_any(normalized, INTERVIEW_TOKENS):
+    if _contains_numeric_entity(normalized):
+        question_type = "numeric_entity"
+        signals.append("numeric_entity")
+    elif _is_literal_riddle_query(normalized):
+        question_type = "literal_riddle"
+        signals.append("literal_riddle")
+    elif mode == "interview" or _contains_any(normalized, INTERVIEW_TOKENS):
         question_type = "interview"
         signals.append("interview_token")
     elif _contains_any(normalized, PLAN_TOKENS):
@@ -361,6 +500,8 @@ def classify_question_type(query: str, session_context: str = "", mode: str = "c
         signals.append("fallback")
 
     confidence = 0.55 if question_type == "general" else 0.75
+    if question_type in {"numeric_entity", "literal_riddle"}:
+        confidence = 0.85
     if len(normalized) <= 8 and question_type == "general":
         confidence = 0.45
 
@@ -377,7 +518,12 @@ def plan_retrieval_route(
     session_context: str = "",
     mode: str = "chat",
 ) -> dict:
-    classification = classify_question_type(rewritten_query or original_query, session_context=session_context, mode=mode)
+    original_query = _normalize_query(original_query)
+    rewritten_query = _normalize_query(rewritten_query)
+    classification_query = original_query if (
+        _contains_numeric_entity(original_query) or _is_literal_riddle_query(original_query)
+    ) else (rewritten_query or original_query)
+    classification = classify_question_type(classification_query, session_context=session_context, mode=mode)
     question_type = classification["question_type"]
     profile = {**ROUTE_PROFILES["general"], **ROUTE_PROFILES.get(question_type, {})}
     return {

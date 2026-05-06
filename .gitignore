@@ -47,6 +47,8 @@ benchmarks/t2retrieval/
 logs/rag_eval/
 *.tmp
 *.temp
+test_tmp/
+test_api_upload_*/
 .pytest_cache/
 pytest-cache-files-*/
 
