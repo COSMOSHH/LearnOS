@@ -44,6 +44,9 @@ class HybridRetriever:
         final_top_k: int | None = None,
         parent_window: int | None = None,
         parent_max_chars: int | None = None,
+        use_bm25: bool = True,
+        use_rerank: bool = True,
+        use_parent: bool = True,
     ) -> tuple[List[Dict], Dict]:
         query_candidates = queries or [query]
         vector_top_k = max(1, int(vector_top_k or self.vector_top_k))
@@ -67,6 +70,11 @@ class HybridRetriever:
                 "max_chars": parent_max_chars,
             },
             "parent_debug": [],
+            "retrieval_config": {
+                "use_bm25": use_bm25,
+                "use_rerank": use_rerank,
+                "use_parent": use_parent,
+            },
         }
 
         merged_candidates = {}
@@ -95,30 +103,31 @@ class HybridRetriever:
                     }
                 )
 
-            tokenized_query = list(jieba.cut(expanded_query))
-            bm25_scores = self.bm25.get_scores(tokenized_query) if self.doc_chunks else []
-            bm25_top_n_idx = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:bm25_top_k]
+            if use_bm25:
+                tokenized_query = list(jieba.cut(expanded_query))
+                bm25_scores = self.bm25.get_scores(tokenized_query) if self.doc_chunks else []
+                bm25_top_n_idx = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:bm25_top_k]
 
-            for index in bm25_top_n_idx:
-                chunk = self.doc_chunks[index]
-                metadata = chunk.get("metadata") or {}
-                candidate_key = self._build_candidate_key(chunk["chunk_text"], metadata)
-                previous_score = merged_candidates.get(candidate_key, {}).get("bm25_score")
-                merged_candidates[candidate_key] = {
-                    "document": chunk["chunk_text"],
-                    "metadata": metadata,
-                    "vector_distance": merged_candidates.get(candidate_key, {}).get("vector_distance"),
-                    "bm25_score": max(float(bm25_scores[index]), float(previous_score or 0)),
-                }
-                debug_payload["bm25_candidates"].append(
-                    {
-                        "query": expanded_query,
-                        "document_title": metadata.get("document_title", ""),
-                        "section_title": metadata.get("section_title", ""),
-                        "chunk_index": metadata.get("chunk_index"),
-                        "bm25_score": float(bm25_scores[index]),
+                for index in bm25_top_n_idx:
+                    chunk = self.doc_chunks[index]
+                    metadata = chunk.get("metadata") or {}
+                    candidate_key = self._build_candidate_key(chunk["chunk_text"], metadata)
+                    previous_score = merged_candidates.get(candidate_key, {}).get("bm25_score")
+                    merged_candidates[candidate_key] = {
+                        "document": chunk["chunk_text"],
+                        "metadata": metadata,
+                        "vector_distance": merged_candidates.get(candidate_key, {}).get("vector_distance"),
+                        "bm25_score": max(float(bm25_scores[index]), float(previous_score or 0)),
                     }
-                )
+                    debug_payload["bm25_candidates"].append(
+                        {
+                            "query": expanded_query,
+                            "document_title": metadata.get("document_title", ""),
+                            "section_title": metadata.get("section_title", ""),
+                            "chunk_index": metadata.get("chunk_index"),
+                            "bm25_score": float(bm25_scores[index]),
+                        }
+                    )
 
         merged_items = list(merged_candidates.values())
         unique_texts = [
@@ -128,56 +137,80 @@ class HybridRetriever:
                 debug_payload,
                 parent_window=parent_window,
                 parent_max_chars=parent_max_chars,
-            )
+            ) if use_parent else item["document"]
             for item in merged_items
         ]
         if not unique_texts:
             return [], debug_payload
 
-        try:
-            response = dashscope.TextReRank.call(
-                model=config.rerank_model,
-                query=query,
-                documents=unique_texts,
-                top_n=final_top_k,
-                return_documents=False,
-            )
-            if response.status_code == 200:
-                final_results = []
-                for item in response.output.results:
-                    index = item.index
-                    metadata = merged_items[index]["metadata"]
-                    debug_payload["reranked_results"].append(
-                        {
-                            "document_title": metadata.get("document_title", ""),
-                            "section_title": metadata.get("section_title", ""),
-                            "chunk_index": metadata.get("chunk_index"),
-                            "rerank_score": item.relevance_score,
-                        }
-                    )
-                    final_results.append(
-                        {
-                            "document": unique_texts[index],
-                            "metadata": metadata,
-                            "score": item.relevance_score,
-                        }
-                    )
-                return final_results, debug_payload
-        except Exception:
-            pass
+        if use_rerank:
+            try:
+                response = dashscope.TextReRank.call(
+                    model=config.rerank_model,
+                    query=query,
+                    documents=unique_texts,
+                    top_n=final_top_k,
+                    return_documents=False,
+                )
+                if response.status_code == 200:
+                    final_results = []
+                    for item in response.output.results:
+                        index = item.index
+                        metadata = merged_items[index]["metadata"]
+                        debug_payload["reranked_results"].append(
+                            {
+                                "document_title": metadata.get("document_title", ""),
+                                "section_title": metadata.get("section_title", ""),
+                                "chunk_index": metadata.get("chunk_index"),
+                                "rerank_score": item.relevance_score,
+                            }
+                        )
+                        final_results.append(
+                            {
+                                "document": unique_texts[index],
+                                "metadata": metadata,
+                                "score": item.relevance_score,
+                            }
+                        )
+                    return final_results, debug_payload
+            except Exception:
+                pass
 
+        ranked_indices = sorted(
+            range(len(merged_items)),
+            key=lambda index: self._fallback_rank_key(merged_items[index]),
+            reverse=True,
+        )
         fallback_results = []
-        for index, item in enumerate(merged_items[:final_top_k]):
+        for index in ranked_indices[:final_top_k]:
+            item = merged_items[index]
+            fallback_score = self._fallback_score(item)
             debug_payload["reranked_results"].append(
                 {
                     "document_title": item["metadata"].get("document_title", ""),
                     "section_title": item["metadata"].get("section_title", ""),
                     "chunk_index": item["metadata"].get("chunk_index"),
-                    "rerank_score": 0.0,
+                    "rerank_score": fallback_score,
+                    "rank_source": "rerank_disabled" if not use_rerank else "rerank_fallback",
                 }
             )
-            fallback_results.append({"document": unique_texts[index], "metadata": item["metadata"], "score": 0.0})
+            fallback_results.append({"document": unique_texts[index], "metadata": item["metadata"], "score": fallback_score})
         return fallback_results, debug_payload
+
+    def _fallback_score(self, item: dict) -> float:
+        vector_distance = item.get("vector_distance")
+        bm25_score = float(item.get("bm25_score") or 0)
+        vector_score = 0.0
+        if vector_distance is not None:
+            vector_score = max(0.0, 1.0 - float(vector_distance))
+        return vector_score + min(1.0, bm25_score / 100.0)
+
+    def _fallback_rank_key(self, item: dict) -> tuple:
+        vector_distance = item.get("vector_distance")
+        has_vector = vector_distance is not None
+        vector_score = 0.0 if vector_distance is None else -float(vector_distance)
+        bm25_score = float(item.get("bm25_score") or 0)
+        return (1 if has_vector else 0, vector_score, bm25_score)
 
     def _build_candidate_key(self, document: str, metadata: dict) -> str:
         document_id = metadata.get("document_id")

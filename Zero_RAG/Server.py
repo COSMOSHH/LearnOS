@@ -13,7 +13,7 @@ import requests
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -232,9 +232,11 @@ class RetrievalEvalCase(BaseModel):
 
 class RetrievalEvalRequest(BaseModel):
     user_id: str = "default_user"
-    cases: list[RetrievalEvalCase] = []
+    cases: list[RetrievalEvalCase] = Field(default_factory=list)
     top_k: int = 5
     low_quality_mrr_threshold: float = 0.5
+    retrieval_config: dict = Field(default_factory=dict)
+    compare_to_original: bool = False
 
 
 class BenchmarkImportRequest(BaseModel):
@@ -842,10 +844,13 @@ def _write_rag_eval_log(
             "top_k": request.top_k,
             "low_quality_mrr_threshold": request.low_quality_mrr_threshold,
             "case_count": payload.get("case_count", 0),
+            "retrieval_config": request.retrieval_config,
+            "compare_to_original": request.compare_to_original,
         },
         "metrics": metrics,
         "low_quality_cases": low_quality_cases,
         "cases": payload.get("cases", []),
+        "comparison": payload.get("comparison"),
         "duration_ms": duration_ms,
         "llm_analysis_prompt": (
             "请分析这次 RAG 检索评测结果。重点判断：1. 召回质量是否达标；"
@@ -855,6 +860,27 @@ def _write_rag_eval_log(
     }
     log_path.write_text(json.dumps(log_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(log_path)
+
+
+def _build_rag_eval_comparison(current_payload: dict, baseline_payload: dict) -> dict:
+    current_metrics = current_payload.get("metrics", {}) or {}
+    baseline_metrics = baseline_payload.get("metrics", {}) or {}
+    current_recall = current_metrics.get("recall_at", {}) or {}
+    baseline_recall = baseline_metrics.get("recall_at", {}) or {}
+    current_ndcg = current_metrics.get("ndcg_at", {}) or {}
+    baseline_ndcg = baseline_metrics.get("ndcg_at", {}) or {}
+    return {
+        "baseline_name": "original_rag",
+        "baseline_metrics": baseline_metrics,
+        "baseline_low_quality_count": len(baseline_payload.get("low_quality_cases", [])),
+        "delta": {
+            "mrr": round(current_metrics.get("mrr", 0) - baseline_metrics.get("mrr", 0), 4),
+            "recall_at_1": round(current_recall.get("1", 0) - baseline_recall.get("1", 0), 4),
+            "recall_at_5": round(current_recall.get("5", 0) - baseline_recall.get("5", 0), 4),
+            "ndcg_at_5": round(current_ndcg.get("5", 0) - baseline_ndcg.get("5", 0), 4),
+        },
+        "baseline_cases": baseline_payload.get("cases", []),
+    }
 
 
 def _run_rag_eval_job(job_id: str, *, session_id: int, request_payload: dict):
@@ -908,7 +934,29 @@ def _run_rag_eval_job(job_id: str, *, session_id: int, request_payload: dict):
             top_k=request.top_k,
             low_quality_mrr_threshold=request.low_quality_mrr_threshold,
             progress_callback=update_eval_progress,
+            retrieval_config=request.retrieval_config,
         )
+        if request.compare_to_original:
+            _update_rag_eval_job(
+                job_id,
+                status="running",
+                stage="baseline",
+                message="正在运行原始 RAG 对比评测。",
+                progress=96,
+            )
+            baseline_payload = evaluate_retrieval_cases(
+                retriever,
+                eval_cases,
+                rewrite_query=rewrite_query,
+                expand_query_to_multi_queries=expand_query_to_multi_queries,
+                plan_retrieval_route=plan_retrieval_route,
+                session_context=_build_session_context_text(session_id),
+                llm_generator=llm_generator,
+                top_k=request.top_k,
+                low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+                retrieval_config={"mode": "original"},
+            )
+            payload["comparison"] = _build_rag_eval_comparison(payload, baseline_payload)
         low_quality_sample_count = save_low_quality_samples(
             session_id=session_id,
             user_id=request.user_id,
@@ -1830,7 +1878,22 @@ async def evaluate_rag_retrieval_endpoint(session_id: int, request: RetrievalEva
             llm_generator=llm_generator,
             top_k=request.top_k,
             low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+            retrieval_config=request.retrieval_config,
         )
+        if request.compare_to_original:
+            baseline_payload = evaluate_retrieval_cases(
+                retriever,
+                eval_cases,
+                rewrite_query=rewrite_query,
+                expand_query_to_multi_queries=expand_query_to_multi_queries,
+                plan_retrieval_route=plan_retrieval_route,
+                session_context=_build_session_context_text(session_id),
+                llm_generator=llm_generator,
+                top_k=request.top_k,
+                low_quality_mrr_threshold=request.low_quality_mrr_threshold,
+                retrieval_config={"mode": "original"},
+            )
+            payload["comparison"] = _build_rag_eval_comparison(payload, baseline_payload)
         low_quality_sample_count = save_low_quality_samples(
             session_id=session_id,
             user_id=request.user_id,

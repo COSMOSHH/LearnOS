@@ -10,6 +10,39 @@ DEFAULT_DATASET_PATH = ROOT_DIR / "rag_eval_cases.json"
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9_]+")
 
 
+LATEST_RAG_CONFIG = {
+    "mode": "latest",
+    "use_query_rewrite": True,
+    "use_dynamic_route": True,
+    "use_multi_query": True,
+    "use_bm25": True,
+    "use_rerank": True,
+    "use_parent": True,
+}
+
+ORIGINAL_RAG_CONFIG = {
+    "mode": "original",
+    "use_query_rewrite": False,
+    "use_dynamic_route": False,
+    "use_multi_query": False,
+    "use_bm25": False,
+    "use_rerank": False,
+    "use_parent": False,
+}
+
+
+def resolve_retrieval_config(config: dict | None = None) -> dict:
+    config = config or {}
+    mode = str(config.get("mode") or "latest").strip().lower()
+    if mode == "original":
+        resolved = dict(ORIGINAL_RAG_CONFIG)
+    elif mode == "custom":
+        resolved = {**LATEST_RAG_CONFIG, **config, "mode": "custom"}
+    else:
+        resolved = {**LATEST_RAG_CONFIG, **config, "mode": "latest"}
+    return resolved
+
+
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
@@ -231,7 +264,9 @@ def evaluate_retrieval_cases(
     top_k: int = 5,
     low_quality_mrr_threshold: float = 0.5,
     progress_callback=None,
+    retrieval_config: dict | None = None,
 ) -> dict[str, Any]:
+    retrieval_config = resolve_retrieval_config(retrieval_config)
     k_values = [1, 3, 5]
     top_k = max(1, int(top_k or 5))
     if top_k not in k_values:
@@ -249,14 +284,21 @@ def evaluate_retrieval_cases(
     for case_index, case in enumerate(valid_cases, start=1):
         query = (case.get("query") or "").strip()
 
-        rewrite_payload = rewrite_query(
-            query,
-            history=[],
-            session_context=session_context,
-            llm_generator=llm_generator,
-        )
+        if retrieval_config.get("use_query_rewrite", True):
+            rewrite_payload = rewrite_query(
+                query,
+                history=[],
+                session_context=session_context,
+                llm_generator=llm_generator,
+            )
+        else:
+            rewrite_payload = {
+                "original_query": query,
+                "rewritten_query": query,
+                "rewrite_reason": "query rewrite disabled by evaluation config",
+            }
         rewritten_query = rewrite_payload.get("rewritten_query", query)
-        if plan_retrieval_route:
+        if plan_retrieval_route and retrieval_config.get("use_dynamic_route", True):
             route_payload = plan_retrieval_route(
                 query,
                 rewritten_query=rewritten_query,
@@ -271,7 +313,7 @@ def evaluate_retrieval_cases(
         route_strategy = route_payload.get("route_strategy") or {}
         classification = route_payload.get("classification") or {}
 
-        if route_strategy.get("use_multi_query", True):
+        if retrieval_config.get("use_multi_query", True) and route_strategy.get("use_multi_query", True):
             expanded_payload = expand_query_to_multi_queries(
                 original_query=query,
                 rewritten_query=rewritten_query,
@@ -289,6 +331,9 @@ def evaluate_retrieval_cases(
             final_top_k=max(top_k, int(route_strategy.get("final_top_k") or top_k)),
             parent_window=route_strategy.get("parent_window"),
             parent_max_chars=route_strategy.get("parent_max_chars"),
+            use_bm25=bool(retrieval_config.get("use_bm25", True)),
+            use_rerank=bool(retrieval_config.get("use_rerank", True)),
+            use_parent=bool(retrieval_config.get("use_parent", True)),
         )
         retrieval_debug.update(
             {
@@ -296,6 +341,7 @@ def evaluate_retrieval_cases(
                 "question_type_confidence": classification.get("confidence", 0.0),
                 "question_type_signals": classification.get("signals", []),
                 "route_strategy": route_strategy,
+                "eval_retrieval_config": retrieval_config,
             }
         )
         sliced = retrieved_results[:top_k]
@@ -377,6 +423,7 @@ def evaluate_retrieval_cases(
                 "buckets": {},
                 "top_k": top_k,
                 "low_quality_mrr_threshold": low_quality_mrr_threshold,
+                "retrieval_config": retrieval_config,
             },
             "low_quality_cases": [],
             "cases": [],
@@ -437,6 +484,7 @@ def evaluate_retrieval_cases(
             "buckets": buckets,
             "top_k": top_k,
             "low_quality_mrr_threshold": low_quality_mrr_threshold,
+            "retrieval_config": retrieval_config,
         },
         "low_quality_cases": low_quality_cases,
         "cases": per_case,

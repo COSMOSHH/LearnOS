@@ -260,6 +260,49 @@ class ServiceTests(unittest.TestCase):
         self.assertAlmostEqual(payload["metrics"]["ndcg_at"]["3"], 0.5)
         self.assertGreaterEqual(len(payload["low_quality_cases"]), 1)
 
+    def test_rag_eval_original_config_disables_advanced_steps(self):
+        class FakeRetriever:
+            def __init__(self):
+                self.kwargs_seen = {}
+                self.queries_seen = []
+
+            def retrieve_with_debug(self, query, queries=None, **kwargs):
+                self.kwargs_seen = kwargs
+                self.queries_seen = queries or []
+                return (
+                    [
+                        {
+                            "document": "target content",
+                            "metadata": {"source": "doc://target", "document_title": "Target"},
+                            "score": 0.9,
+                        }
+                    ],
+                    {"debug": "ok"},
+                )
+
+        retriever = FakeRetriever()
+        payload = rag_eval_service.evaluate_retrieval_cases(
+            retriever,
+            [{"query": "target", "relevant_sources": ["target"]}],
+            rewrite_query=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rewrite should be disabled")),
+            expand_query_to_multi_queries=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("multi-query should be disabled")
+            ),
+            plan_retrieval_route=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("route should be disabled")
+            ),
+            session_context="",
+            top_k=3,
+            retrieval_config={"mode": "original"},
+        )
+
+        self.assertEqual(payload["metrics"]["retrieval_config"]["mode"], "original")
+        self.assertFalse(retriever.kwargs_seen["use_bm25"])
+        self.assertFalse(retriever.kwargs_seen["use_rerank"])
+        self.assertFalse(retriever.kwargs_seen["use_parent"])
+        self.assertEqual(retriever.queries_seen, ["target"])
+        self.assertEqual(payload["cases"][0]["rewritten_query"], "target")
+
     def test_rag_eval_supports_doc_ids_and_ndcg(self):
         class FakeRetriever:
             def retrieve_with_debug(self, query, queries=None, **kwargs):

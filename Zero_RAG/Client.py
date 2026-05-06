@@ -817,12 +817,19 @@ def poll_rag_eval_job(job_id: str, timeout_seconds: int = 3600) -> dict | None:
         time.sleep(1)
 
 
-def run_rag_evaluation(top_k: int = 5, threshold: float = 0.5):
+def run_rag_evaluation(
+    top_k: int = 5,
+    threshold: float = 0.5,
+    retrieval_config: dict | None = None,
+    compare_to_original: bool = False,
+):
     payload = {
         "user_id": st.session_state["user_id"],
         "cases": st.session_state.get("rag_eval_cases") or [],
         "top_k": int(top_k),
         "low_quality_mrr_threshold": float(threshold),
+        "retrieval_config": retrieval_config or {"mode": "latest"},
+        "compare_to_original": bool(compare_to_original),
     }
     try:
         response = requests.post(
@@ -1898,6 +1905,42 @@ with rag_eval_tab:
         with rag_eval_col2:
             rag_eval_threshold = st.slider("低质量阈值(MRR)", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
 
+        st.markdown("**RAG 对比配置**")
+        rag_mode_label = st.radio(
+            "评测模式",
+            ["最新RAG", "原始RAG", "自定义开关"],
+            horizontal=True,
+            index=0,
+        )
+        if rag_mode_label == "原始RAG":
+            rag_eval_retrieval_config = {"mode": "original"}
+            rag_eval_compare_original = False
+            st.caption("原始RAG：仅向量召回，不启用 Query Rewrite、动态路由、Multi-Query、BM25、Rerank 和 Parent 回填。")
+        elif rag_mode_label == "自定义开关":
+            custom_col1, custom_col2, custom_col3 = st.columns(3)
+            with custom_col1:
+                use_query_rewrite = st.checkbox("Query Rewrite", value=True)
+                use_dynamic_route = st.checkbox("动态路由", value=True)
+            with custom_col2:
+                use_multi_query = st.checkbox("Multi-Query", value=True)
+                use_bm25 = st.checkbox("BM25", value=True)
+            with custom_col3:
+                use_rerank = st.checkbox("Rerank", value=True)
+                use_parent = st.checkbox("Parent 回填", value=True)
+            rag_eval_retrieval_config = {
+                "mode": "custom",
+                "use_query_rewrite": use_query_rewrite,
+                "use_dynamic_route": use_dynamic_route,
+                "use_multi_query": use_multi_query,
+                "use_bm25": use_bm25,
+                "use_rerank": use_rerank,
+                "use_parent": use_parent,
+            }
+            rag_eval_compare_original = st.checkbox("同时跑原始RAG作为 baseline", value=True)
+        else:
+            rag_eval_retrieval_config = {"mode": "latest"}
+            rag_eval_compare_original = st.checkbox("同时跑原始RAG作为 baseline", value=True)
+
         rag_action_col1, rag_action_col2, rag_action_col3, rag_action_col4 = st.columns([1, 1, 1, 1])
         with rag_action_col1:
             if st.button("预览默认评测集", use_container_width=True):
@@ -1910,7 +1953,12 @@ with rag_eval_tab:
                 import_scifact_benchmark()
         with rag_action_col4:
             if st.button("运行RAG评测", use_container_width=True):
-                run_rag_evaluation(top_k=rag_eval_top_k, threshold=rag_eval_threshold)
+                run_rag_evaluation(
+                    top_k=rag_eval_top_k,
+                    threshold=rag_eval_threshold,
+                    retrieval_config=rag_eval_retrieval_config,
+                    compare_to_original=rag_eval_compare_original,
+                )
         zh_action_col1, zh_action_col2 = st.columns([1, 1])
         with zh_action_col1:
             t2_case_limit = st.number_input(
@@ -1939,6 +1987,24 @@ with rag_eval_tab:
             metrics = rag_eval_data.get("metrics", {})
             if rag_eval_data.get("log_path"):
                 st.caption(f"评测日志：{rag_eval_data.get('log_path')}")
+            active_config = metrics.get("retrieval_config") or {}
+            if active_config:
+                enabled_items = [
+                    name
+                    for name, enabled in [
+                        ("Query Rewrite", active_config.get("use_query_rewrite")),
+                        ("动态路由", active_config.get("use_dynamic_route")),
+                        ("Multi-Query", active_config.get("use_multi_query")),
+                        ("BM25", active_config.get("use_bm25")),
+                        ("Rerank", active_config.get("use_rerank")),
+                        ("Parent 回填", active_config.get("use_parent")),
+                    ]
+                    if enabled
+                ]
+                st.caption(
+                    f"当前模式：{active_config.get('mode', 'latest')} | "
+                    f"启用：{', '.join(enabled_items) if enabled_items else '仅向量召回'}"
+                )
             metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
             with metric_col1:
                 st.metric("Case 数", rag_eval_data.get("case_count", 0))
@@ -1950,6 +2016,27 @@ with rag_eval_tab:
                 st.metric("Recall@5", (metrics.get("recall_at", {}) or {}).get("5", 0))
             with metric_col5:
                 st.metric("NDCG@5", (metrics.get("ndcg_at", {}) or {}).get("5", 0))
+
+            comparison = rag_eval_data.get("comparison") or {}
+            if comparison:
+                st.markdown("**与原始RAG对比**")
+                baseline_metrics = comparison.get("baseline_metrics") or {}
+                baseline_recall = baseline_metrics.get("recall_at") or {}
+                baseline_ndcg = baseline_metrics.get("ndcg_at") or {}
+                delta = comparison.get("delta") or {}
+                cmp_col1, cmp_col2, cmp_col3, cmp_col4 = st.columns(4)
+                with cmp_col1:
+                    st.metric("MRR", metrics.get("mrr", 0), delta.get("mrr", 0))
+                    st.caption(f"原始：{baseline_metrics.get('mrr', 0)}")
+                with cmp_col2:
+                    st.metric("Recall@1", (metrics.get("recall_at", {}) or {}).get("1", 0), delta.get("recall_at_1", 0))
+                    st.caption(f"原始：{baseline_recall.get('1', 0)}")
+                with cmp_col3:
+                    st.metric("Recall@5", (metrics.get("recall_at", {}) or {}).get("5", 0), delta.get("recall_at_5", 0))
+                    st.caption(f"原始：{baseline_recall.get('5', 0)}")
+                with cmp_col4:
+                    st.metric("NDCG@5", (metrics.get("ndcg_at", {}) or {}).get("5", 0), delta.get("ndcg_at_5", 0))
+                    st.caption(f"原始：{baseline_ndcg.get('5', 0)}")
 
             low_quality_cases = rag_eval_data.get("low_quality_cases", [])
             buckets = metrics.get("buckets") or {}
